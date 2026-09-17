@@ -160,21 +160,14 @@ Key cross-file facts:
 Remaining items from the first SM120 baseline, best first. Measurements go in
 `docs/PERF_BASELINE.md`. When an item is finished, delete it from this list.
 
-1. **Video VAE decode (20 s on a 15 s clip).** It is GPU-bound on SM120:
-   12.4 s TF32 GEMM and 4.6 s F32 MMA attention. Host work already runs on a
-   finisher thread. Exact FP32, every tile size and the VRAM headroom were
-   re-priced on 2026-09-17 and all lost. `H3_INT8_VAE=1` is 11.6 s at
-   50.8 dB and is waiting on a decision to make it the default. The
-   attention's warp count was also re-checked: 4 is neutral and 16 does not
-   build.
-2. **Anchored session prompts still reload.** With `--first`/`--last` or
+1. **Anchored session prompts still reload.** With `--first`/`--last` or
    references, each new prompt re-runs the vision encoder and VAE encoder
    loads (fox-s2 knobs: 14.8 s per new prompt, against ~3 s for plain T2VA).
-3. **Long-N SDPA needs a new kernel shape, not a retune.** Tile, warp,
+2. **Long-N SDPA needs a new kernel shape, not a retune.** Tile, warp,
    occupancy and barrier probes were all REJECT on 2026-09-17. The open idea
    is fewer K/V staging bytes per FLOP, e.g. several query tiles sharing one
    staged KV tile.
-4. **Memory-pool release threshold.** The 24 GiB value in `h3_gpu_create`
+3. **Memory-pool release threshold.** The 24 GiB value in `h3_gpu_create`
    is still unmeasured on SM120.
 
 ## Generate presets and quality rules
@@ -199,6 +192,9 @@ dir `PERF2_OUT`).
 Inherited performance discipline:
 - Default flags are the **quality path**. `--token-reduction`, `--sol-attn`,
   `--reuse 3` and `H3_INT8_VAE=1` stay opt-in and are never bit-identical.
+  `H3_INT8_VAE=1` was re-priced on SM120 (15 s decode 18.8 s → 11.6 s, fox-fast
+  44.4 dB / SSIM 0.987) and deliberately **kept opt-in** anyway: the default
+  path keeps bit-identical output. Don't re-open it without being asked.
 - A default-path optimization is KEEP only if fox-fast stays bit-identical, or
   measures **PSNR ≥ 24 dB and SSIM ≥ 0.85** against the reference. Otherwise
   it is opt-in or REJECT. Record KEEP/REJECT with numbers.

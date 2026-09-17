@@ -95,8 +95,19 @@ All builds give hash `0565e3cd6ea0b5e4`, so 8 stays.
 `H3_INT8_VAE=1` with the finisher thread: 11.56 s on the 15 s latent (SSIM
 0.9958, PSNR 50.8 dB against TF32). On fox-fast: VAE phase 1.47 → 1.23 s, PSNR
 44.4 dB and SSIM 0.987 against `4facfc896f6f`. That clears the 24 dB / 0.85
-default gate by a wide margin. It stays opt-in for now, because the project
-rules list it as opt-in.
+default gate by a wide margin, but it **stays opt-in** by decision on
+2026-09-17: the quality path keeps bit-identical output, and this is the same
+trade the project already declined for `--token-reduction` and `--sol-attn`.
+
+The 300 W power cap also stays as it is (2026-09-17), so the sustained-load
+figures above are the ones to compare against.
+
+### What is left in this phase
+
+The decode is 20 s, of which 12.4 s is cuBLAS TF32 GEMM and 4.6 s is the F32
+MMA attention. Both are already on the tensor cores, and the host is off the
+critical path. The remaining routes — BF16 or INT8 operands — all change the
+bits, which is the trade above. No bit-identical lever is left here.
 
 ## 2026-09-17 — SM120 INT8 GEMM options: nothing to take (RTX PRO 6000 Blackwell Max-Q)
 
