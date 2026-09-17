@@ -209,6 +209,8 @@ static void fail(char *error, size_t error_size, const char *format, ...) {
     va_end(arguments);
 }
 
+static void free_request_state(h3_dit *dit);
+
 static unsigned command_block_interval(const h3_dit *dit) {
     const char *value = getenv("H3_DIT_COMMAND_BLOCKS");
     if (value && *value) {
@@ -2695,6 +2697,76 @@ size_t h3_dit_audio_elements(const h3_dit *dit) {
         (size_t)dit->audio_t : 0;
 }
 
+int h3_dit_rebind(h3_dit *dit, const h3_text_embedding *text,
+                  const h3_layout *layout, int token_reduction,
+                  float spatial_rope_scale,
+                  const float *condition_video_rows,
+                  size_t condition_video_elements,
+                  const float *condition_audio_rows,
+                  size_t condition_audio_elements,
+                  h3_dit_progress progress, void *progress_opaque,
+                  char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!dit || !layout || dit->ssd_streaming ||
+        !isfinite(spatial_rope_scale) || spatial_rope_scale <= 0.0f) {
+        fail(error, error_size, "invalid DiT rebind arguments");
+        return 0;
+    }
+    /* The schedule was precomputed for the old condition presence, and the
+     * INT8 projection choice for the old sequence length. */
+    int had_video_condition = dit->video_condition_rows != 0;
+    int had_audio_condition = dit->audio_condition_rows != 0;
+    int had_long_sequence = dit->sequence >= 128;
+    h3_gpu_profile_restart(dit->gpu);
+    free_request_state(dit);
+    dit->token_reduction = 0;
+    dit->token_reduction_active = 0;
+    dit->reduced_sequence = 0;
+    dit->reduced_video_rows = 0;
+    dit->token_baseline_rows = 0;
+    dit->core_forward_count = 0;
+    dit->core_residual_ready = 0;
+    dit->spatial_rope_scale = spatial_rope_scale;
+    if (!copy_layout(dit, layout, error, error_size) ||
+        !validate_layout(dit, text, error, error_size)) return 0;
+    if ((dit->video_condition_rows != 0) != had_video_condition ||
+        (dit->audio_condition_rows != 0) != had_audio_condition ||
+        (dit->sequence >= 128) != had_long_sequence) {
+        fail(error, error_size,
+             "prepared DiT schedule does not fit the new layout");
+        return 0;
+    }
+    if (!configure_token_reduction(dit, token_reduction, error, error_size))
+        return 0;
+    size_t wanted_video = (size_t)dit->video_condition_rows * VIDEO_PATCH;
+    size_t wanted_audio = (size_t)dit->audio_condition_rows * AUDIO_CHANNELS;
+    if (condition_video_elements != wanted_video ||
+        condition_audio_elements != wanted_audio ||
+        (wanted_video && !condition_video_rows) ||
+        (wanted_audio && !condition_audio_rows)) {
+        fail(error, error_size,
+             "condition row elements do not match the packed DiT layout");
+        return 0;
+    }
+    report(progress, progress_opaque, "refine text", 0, 1);
+    if (!refine_text(dit, text, error, error_size)) return 0;
+    report(progress, progress_opaque, "refine text", 1, 1);
+    if (!prepare_rope(dit, error, error_size) ||
+        !prepare_maps(dit, text, error, error_size) ||
+        !prepare_projection_maps(dit, error, error_size) ||
+        !prepare_token_reduction_maps(dit, error, error_size) ||
+        !allocate_activations(dit, error, error_size)) return 0;
+    if ((wanted_video && !h3_gpu_tensor_write_f32_range(
+             dit->video_input, 0, condition_video_rows, wanted_video)) ||
+        (wanted_audio && !h3_gpu_tensor_write_f32_range(
+             dit->audio_input, 0, condition_audio_rows, wanted_audio))) {
+        fail(error, error_size, "cannot write persistent DiT condition rows");
+        return 0;
+    }
+    h3_gpu_profile_mark(dit->gpu, "rebind");
+    return 1;
+}
+
 int h3_dit_reset_run(h3_dit *dit,
                      const float *condition_video_rows,
                      size_t condition_video_elements,
@@ -3282,8 +3354,9 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
         progress, progress_opaque, NULL, NULL, error, error_size);
 }
 
-void h3_dit_free(h3_dit *dit) {
-    if (!dit) return;
+/* Everything sized or valued by the request's text and packed layout. The
+ * transformer weights, AdaLN schedule and gate-ranked block set survive. */
+static void free_request_state(h3_dit *dit) {
     int steps = h3_dit_schedule_steps(dit->schedule);
     if (dit->row_maps) for (int step = 0; step < steps; step++)
         h3_gpu_tensor_free(dit->row_maps[step]);
@@ -3297,20 +3370,15 @@ void h3_dit_free(h3_dit *dit) {
     free(dit->reduced_row_maps);
     free(dit->final_audio_maps);
     free(dit->final_video_maps);
+    dit->row_maps = NULL;
+    dit->reduced_row_maps = NULL;
+    dit->final_audio_maps = NULL;
+    dit->final_video_maps = NULL;
     free_tensor(&dit->refined_text);
     free_tensor(&dit->rope_cos);
     free_tensor(&dit->rope_sin);
     free_tensor(&dit->reduced_rope_cos);
     free_tensor(&dit->reduced_rope_sin);
-    free_tensor(&dit->video_patch_w); free_tensor(&dit->video_patch_b);
-    free_tensor(&dit->audio_patch_w); free_tensor(&dit->audio_patch_b);
-    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
-        free_block(&dit->blocks[block]);
-    free_block(&dit->stream_slots[0]);
-    free_block(&dit->stream_slots[1]);
-    free_tensor(&dit->final_norm);
-    free_tensor(&dit->final_video_w); free_tensor(&dit->final_video_b);
-    free_tensor(&dit->final_audio_w); free_tensor(&dit->final_audio_b);
 #define FREE(field) free_tensor(&dit->field)
     if (dit->activation_aliases) {
         dit->attention_heads = NULL;
@@ -3334,6 +3402,21 @@ void h3_dit_free(h3_dit *dit) {
     FREE(audio_output_bf16); FREE(video_output_bf16);
     FREE(previous_audio_velocity); FREE(previous_video_velocity);
 #undef FREE
+    h3_layout_free(&dit->layout);
+}
+
+void h3_dit_free(h3_dit *dit) {
+    if (!dit) return;
+    free_request_state(dit);
+    free_tensor(&dit->video_patch_w); free_tensor(&dit->video_patch_b);
+    free_tensor(&dit->audio_patch_w); free_tensor(&dit->audio_patch_b);
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+        free_block(&dit->blocks[block]);
+    free_block(&dit->stream_slots[0]);
+    free_block(&dit->stream_slots[1]);
+    free_tensor(&dit->final_norm);
+    free_tensor(&dit->final_video_w); free_tensor(&dit->final_video_b);
+    free_tensor(&dit->final_audio_w); free_tensor(&dit->final_audio_b);
     h3_dit_schedule_free(dit->schedule);
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
@@ -3347,7 +3430,6 @@ void h3_dit_free(h3_dit *dit) {
     }
     h3_gpu_free(dit->gpu);
     h3_weight_store_free(dit->weights);
-    h3_layout_free(&dit->layout);
     free(dit);
 }
 

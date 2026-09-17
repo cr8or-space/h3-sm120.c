@@ -127,6 +127,8 @@ void h3_cache_clear(h3_ctx *ctx) {
     ctx->dit = NULL;
     free(ctx->dit_key);
     ctx->dit_key = NULL;
+    free(ctx->dit_weights_key);
+    ctx->dit_weights_key = NULL;
     h3_video_vae_decoder_free(ctx->video_decoder);
     ctx->video_decoder = NULL;
     free(ctx->video_decoder_key);
@@ -1089,6 +1091,7 @@ static h3_result *h3_generate_once(h3_ctx *ctx, const char *prompt,
     h3_result *result = NULL;
     char *conditioning_key = NULL;
     char *prepared_key = NULL;
+    char *dit_weights_key = NULL;
     char *decoder_key = NULL;
     int conditioning_hit = 0;
     int conditioned = 0;
@@ -1117,7 +1120,15 @@ static h3_result *h3_generate_once(h3_ctx *ctx, const char *prompt,
     }
     prepared_key = h3_prepared_key(
         conditioning_key, params, render_width, render_height);
-    if (!prepared_key) {
+    h3_key weights_base = {0};
+    if (prepared_key &&
+        h3_key_append(&weights_base, "mode=%d|transformer=%s", ref2va,
+                      dit_path)) {
+        dit_weights_key = h3_prepared_key(
+            weights_base.text, params, render_width, render_height);
+    }
+    free(weights_base.text);
+    if (!prepared_key || !dit_weights_key) {
         h3_set_error(ctx, "out of memory constructing prepared-model cache key");
         goto cleanup;
     }
@@ -1136,11 +1147,16 @@ static h3_result *h3_generate_once(h3_ctx *ctx, const char *prompt,
         ctx->video_decoder_key = NULL;
     }
     if (ctx->cache_enabled && ctx->dit &&
-        (!ctx->dit_key || strcmp(ctx->dit_key, prepared_key))) {
+        (!ctx->dit_key || strcmp(ctx->dit_key, prepared_key)) &&
+        (!ctx->dit_weights_key ||
+         strcmp(ctx->dit_weights_key, dit_weights_key) ||
+         params->ssd_streaming)) {
         h3_dit_free(ctx->dit);
         ctx->dit = NULL;
         free(ctx->dit_key);
         ctx->dit_key = NULL;
+        free(ctx->dit_weights_key);
+        ctx->dit_weights_key = NULL;
     }
     conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
         !strcmp(ctx->conditioning_key, conditioning_key);
@@ -1660,7 +1676,33 @@ static h3_result *h3_generate_once(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
         fprintf(stderr, "h3: prepared DiT cache hit\n");
-    } else if (conditioned) {
+    } else if (ctx->cache_enabled && ctx->dit && ctx->dit_weights_key &&
+               !strcmp(ctx->dit_weights_key, dit_weights_key)) {
+        char *key_copy = strdup(prepared_key);
+        if (key_copy && h3_dit_rebind(
+                ctx->dit, &text, &layout, params->token_reduction,
+                spatial_rope_scale,
+                condition_video_rows, condition_video_elements,
+                condition_audio_rows, condition_audio_elements,
+                h3_dit_progress_bridge, &progress, detail, sizeof(detail))) {
+            dit = ctx->dit;
+            dit_is_cached = 1;
+            free(ctx->dit_key);
+            ctx->dit_key = key_copy;
+            fprintf(stderr, "h3: prepared DiT rebound to the new request\n");
+        } else {
+            free(key_copy);
+            fprintf(stderr, "h3: DiT rebind failed (%s); reloading\n",
+                    detail);
+            h3_dit_free(ctx->dit);
+            ctx->dit = NULL;
+            free(ctx->dit_key);
+            ctx->dit_key = NULL;
+            free(ctx->dit_weights_key);
+            ctx->dit_weights_key = NULL;
+        }
+    }
+    if (!dit && conditioned) {
         dit = h3_dit_load_conditioned(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
@@ -1681,7 +1723,7 @@ static h3_result *h3_generate_once(h3_ctx *ctx, const char *prompt,
             condition_video_rows, condition_video_elements,
             condition_audio_rows, condition_audio_elements,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
-    } else {
+    } else if (!dit) {
         dit = h3_dit_load_t2va(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
@@ -1712,6 +1754,7 @@ static h3_result *h3_generate_once(h3_ctx *ctx, const char *prompt,
         } else {
             ctx->dit = dit;
             ctx->dit_key = key_copy;
+            ctx->dit_weights_key = strdup(dit_weights_key);
             dit_is_cached = 1;
             fprintf(stderr, "h3: prepared DiT cache miss; model retained\n");
         }
@@ -1772,6 +1815,8 @@ static h3_result *h3_generate_once(h3_ctx *ctx, const char *prompt,
             ctx->dit = NULL;
             free(ctx->dit_key);
             ctx->dit_key = NULL;
+            free(ctx->dit_weights_key);
+            ctx->dit_weights_key = NULL;
             dit_is_cached = 0;
         }
         goto cleanup;
@@ -1883,6 +1928,7 @@ cleanup:
     h3_prefetch_join(vae_prefetch, vae_prefetch_started);
     free(conditioning_key);
     free(prepared_key);
+    free(dit_weights_key);
     free(decoder_key);
     free(tokenizer_path); free(text_path); free(dit_path); free(vae_path);
     free(audio_vae_path);

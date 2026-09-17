@@ -77,6 +77,21 @@ h3_dit *h3_dit_load_conditioned(
                          char *error, size_t error_size);
 void h3_dit_free(h3_dit *dit);
 
+/* Point a loaded transformer at a new prompt or packed layout. Weights, the
+ * AdaLN schedule and the gate-ranked block set are kept; text refinement,
+ * RoPE, row maps and activations are rebuilt. The request must share the
+ * load's steps, layer and fusion settings, and its condition presence; a
+ * failed rebind leaves the DiT unusable, so free it and load afresh. */
+int h3_dit_rebind(h3_dit *dit, const h3_text_embedding *text,
+                  const h3_layout *layout, int token_reduction,
+                  float spatial_rope_scale,
+                  const float *condition_video_rows,
+                  size_t condition_video_elements,
+                  const float *condition_audio_rows,
+                  size_t condition_audio_elements,
+                  h3_dit_progress progress, void *progress_opaque,
+                  char *error, size_t error_size);
+
 /* Reset mutable sampler state and replace seed-dependent condition rows before
  * reusing an otherwise identical prepared transformer. */
 int h3_dit_reset_run(h3_dit *dit,

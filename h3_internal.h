@@ -28,6 +28,9 @@ struct h3_ctx {
     size_t conditioning_reference_count;
     int conditioning_present;
     char *dit_key;
+    /* The prepared key minus the prompt and conditioning media: a DiT whose
+     * weights key matches can be rebound instead of reloaded. */
+    char *dit_weights_key;
     struct h3_dit *dit;
     char *video_decoder_key;
     struct h3_video_vae_decoder *video_decoder;
