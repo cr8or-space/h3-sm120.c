@@ -119,6 +119,20 @@ int main(int argc, char **argv) {
         else
             printf("  LDMATRIX");
     }
+    /* Kernel variants that claim to be bit-identical must print the same
+     * hash for the same shape (the inputs are seeded). */
+    {
+        uint16_t *result = (uint16_t *)malloc(count * sizeof(*result));
+        uint64_t hash = UINT64_C(1469598103934665603);
+        if (result && h3_gpu_tensor_read_bf16(output, result, count)) {
+            for (size_t index = 0; index < count; index++) {
+                hash ^= result[index];
+                hash *= UINT64_C(1099511628211);
+            }
+            printf("  out %016llx", (unsigned long long)hash);
+        }
+        free(result);
+    }
     printf("\n");
 
     h3_gpu_tensor_free(query);

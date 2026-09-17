@@ -7,6 +7,53 @@ numbers are in the snapshots below. The 2026-08-17 tables after them are the
 SM120 (RTX PRO 6000 Blackwell Max-Q) sections are labelled as such. Every
 other section in this file is GB10.
 
+## 2026-09-17 — SM120 long-N SDPA probes: no bit-identical win (RTX PRO 6000 Blackwell Max-Q)
+
+The MMA SDPA kernel is 74% of the 15 s wall on SM120. It was probed with
+`h3_sdpa_bench` (seq 44800 and 1874, 56 heads, head_dim 128). The bench now
+prints an output hash, so a variant that claims to be bit-identical can be
+checked. Shipping speed is 414–421 ms per call at 44800 (138 TFLOP/s; GB10 is
+1729 ms) and 0.71–0.72 ms at 1874. Hashes are `526b4e68049b` and
+`7e8cc59d4496`.
+
+`ncu` (passwordless sudo on the host), shipping kernel at 44800:
+- Occupancy is 16.7%, with 7.99 of 48 warps per SM. Both registers (175 per
+  thread) and static shared memory (35.84 KB per block) limit it to 2 blocks.
+- Active warps per scheduler are 1.99, and eligible warps 0.37.
+- The top stall is the L1/TEX scoreboard, at 30% of cycles.
+- Throughput against peak: L1/TEX 71%, compute (SM) 47%, DRAM 0.36%.
+
+GB10 was the opposite: it was DRAM-bound at long N (273 GB/s roof). SM120 is
+bound by L1 traffic from the per-block K/V tile fill. Every (query tile, head)
+block re-reads its head's K and V.
+
+Pricing with `H3_SDPA_HALF` at 44800: full 416 ms, without P·V 337 ms,
+without Q·Kᵀ 248 ms. In a Q·Kᵀ-only build that also skips the V tile fill,
+the kernel drops to 215 ms, so filling V costs ~120 ms.
+
+| Variant (44800) | ms | vs shipping | Bits | Verdict |
+|---|---:|---:|---|---|
+| shipping | 414–421 | — | same | |
+| Q from global, 4 warps | 417–418 | ±0 | same | REJECT (neutral) |
+| 8 warps (M=128, 256 threads), Q from global | 441–442 | **+6.5%** | same | REJECT |
+| `LD=132` + `__launch_bounds__(128, 3)` | — | — | — | REJECT: `misaligned address` (LD must be a multiple of 8) |
+| Q·Kᵀ-only with a tiny V tile, min 3 / 4 blocks per SM | 215 / 219 | ±0 against the 2-block build | same | occupancy is not the lever |
+| V converted to FP16 once per call (separate kernel) | 416–421 | ±0 (1874: **+9%**) | same | REJECT: the per-tile convert is not the cost |
+| `H3_SDPA_LDMATRIX=0` (scalar B loads) | 446–448 | +7% | same | ldmatrix stays |
+| drop the barrier at the top of each KV tile | 410–413 | −1.5% | **one run differs** | REJECT: races the tile fill |
+
+Conclusions:
+- Raising occupancy does nothing even when both limits are removed, which
+  matches GB10.
+- The V fill cost is its load and store traffic, not the BF16→FP16 math.
+- Widening the query tile costs more than the K/V traffic it saves.
+
+No bit-identical variant beats shipping by more than noise, so all kernel
+edits were reverted. A real gain needs fewer bytes per FLOP of K/V staging, for
+example several query tiles sharing one staged KV tile. That means a new
+kernel shape, not a retune. Probe binaries and logs are kept outside the repo,
+in the state directory.
+
 ## 2026-09-17 — SM120 session reuse and loader verdict (RTX PRO 6000 Blackwell Max-Q)
 
 ### KEEP: resident text encoder and DiT rebind in interactive sessions
