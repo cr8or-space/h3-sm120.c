@@ -164,8 +164,9 @@ Remaining items from the first SM120 baseline, best first. Measurements go in
    12.4 s TF32 GEMM and 4.6 s F32 MMA attention. Host work already runs on a
    finisher thread. Exact FP32, every tile size and the VRAM headroom were
    re-priced on 2026-09-17 and all lost. `H3_INT8_VAE=1` is 11.6 s at
-   50.8 dB and is waiting on a decision to make it the default. Open: the
-   attention's warp count (8, chosen on GB10).
+   50.8 dB and is waiting on a decision to make it the default. The
+   attention's warp count was also re-checked: 4 is neutral and 16 does not
+   build.
 2. **Anchored session prompts still reload.** With `--first`/`--last` or
    references, each new prompt re-runs the vision encoder and VAE encoder
    loads (fox-s2 knobs: 14.8 s per new prompt, against ~3 s for plain T2VA).

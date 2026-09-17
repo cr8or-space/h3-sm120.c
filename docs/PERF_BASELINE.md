@@ -79,6 +79,19 @@ End to end:
 The VRAM headroom does not help, because larger tiles lose to attention's N²
 cost well before memory binds. The tile scorer's 272 px choice stays.
 
+### REJECT: other warp counts for the VAE's F32 attention
+
+`H3_MMA_F32_WARPS` is a compile-time constant (`NVCC_EXTRA=-DH3_MMA_F32_WARPS=N`).
+With the finisher thread, on the 15 s latent:
+- 4 warps: 18.87 / 19.11 s.
+- 8 warps (shipping): 18.84 / 18.95 s.
+- 16 warps: does not build. `ptxas` reports 0x12000 bytes of shared data, over
+  the 0xc000 limit.
+
+All builds give hash `0565e3cd6ea0b5e4`, so 8 stays.
+
+### INT8 VAE
+
 `H3_INT8_VAE=1` with the finisher thread: 11.56 s on the 15 s latent (SSIM
 0.9958, PSNR 50.8 dB against TF32). On fox-fast: VAE phase 1.47 → 1.23 s, PSNR
 44.4 dB and SSIM 0.987 against `4facfc896f6f`. That clears the 24 dB / 0.85
