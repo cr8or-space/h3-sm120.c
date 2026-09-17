@@ -103,6 +103,12 @@ of this command are about **15.6 s** wall (**8.17 s** GPU Euler denoise);
 output md5 prefix `f5282774d3a4`. Dated tables:
 [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md).
 
+For several prompts, run `./h3 -d /path/to/MiniMax-H3` without `-p`. The
+interactive session (or prompts piped on stdin) keeps the text encoder, DiT
+and video VAE on the GPU between prompts. On the RTX PRO 6000 Blackwell, a
+new fox-fast prompt then takes 3.2 s instead of 9.3 s, with identical output.
+`!help` lists the settings commands.
+
 ## HIP-page presets (GB10, v0.2.2, retest 2026-09-09 / TR 2026-09-10 / sol-attn 2026-09-14)
 
 Same CLI knobs as the [h3-hip.c](https://alexhegit.github.io/h3-hip.c/)

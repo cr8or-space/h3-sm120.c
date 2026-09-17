@@ -131,10 +131,15 @@ Key cross-file facts:
   `H3_DISABLE_INT8_*`, `H3_BF16_MLP`, `H3_SDPA_LDMATRIX=0`, `H3_SDPA_HALF`, …;
   `grep -n 'getenv("H3_' h3_dit.c h3_gpu.cu`). Keep an oracle for any new fused
   path so A/B against the unfused path stays possible.
-- **GB10-shaped assumptions to revisit on SM120:** loader
-  fan-out (`H3_LOAD_READ_THREADS`, `H3_LOAD_STAGE_MIB`, pinned `stage_host`
-  buffers) tuned for Spark NVMe and UMA, where SM120 loads over PCIe from
-  network storage; the 24 GiB memory-pool release threshold in `h3_gpu_create`;
+- **Sessions keep models on the card.** Without `-p`, `./h3` is a REPL that
+  also reads prompts piped on stdin. It holds the Qwen weights resident
+  (`h3_text_encoder_load`; `H3_TEXT_RESIDENT=0|1`), rebinds the retained DiT
+  to each new prompt (`h3_dit_rebind`), and keeps the video decoder.
+  Single-shot `-p` runs still load everything per process. Loader fan-out
+  was re-measured on SM120 (2026-09-17) and is bound by page-cache copy
+  speed, not by `H3_LOAD_STAGE_MIB` or `H3_LOAD_READ_THREADS`: leave it.
+- **GB10-shaped assumptions to revisit on SM120:** the 24 GiB memory-pool
+  release threshold in `h3_gpu_create`;
   MMA/GEMM tile widths that were chosen because wider variants (`tcgen05`,
   WGMMA, `ldmatrix.x4`) were closed on GB10. Re-probe those on SM120
   (`tools/h3_ldmatrix_map.cu` is the probe pattern) rather than inheriting the

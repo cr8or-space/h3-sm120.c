@@ -7,6 +7,68 @@ numbers are in the snapshots below. The 2026-08-17 tables after them are the
 SM120 (RTX PRO 6000 Blackwell Max-Q) sections are labelled as such. Every
 other section in this file is GB10.
 
+## 2026-09-17 — SM120 session reuse and loader verdict (RTX PRO 6000 Blackwell Max-Q)
+
+### KEEP: resident text encoder and DiT rebind in interactive sessions
+
+Before this change, a session (`./h3 -d ROOT` with no `-p`, including
+prompts piped to stdin) already kept the conditioning, the prepared DiT and
+the video decoder, but only while the prompt stayed the same. A new prompt
+restaged 46.9 GiB of Qwen weights and reloaded the 18 GiB INT8 DiT. Two
+changes fix that:
+- The Qwen language weights stay on the card (`h3_text_encoder_load`).
+- The DiT keeps its weights, AdaLN schedule and gate-ranked blocks, and
+  rebuilds only its text-dependent state (`h3_dit_rebind`).
+
+Session benchmark: fox-fast knobs, seed 42, four generations in one process.
+The prompts are fox-fast, then the fox-s2 prompt, then fox-fast twice. The
+second and third generations each change the prompt.
+
+| Generation | Before | Resident text encoder | + DiT rebind | md5 prefix |
+|---|---:|---:|---:|---|
+| 1 fox-fast (cold session) | 10.39 s | 10.56 s | 10.54 s | `4facfc896f6f` |
+| 2 new prompt | 9.30 s | 5.07 s | **3.23 s** | `19b84c556221` |
+| 3 new prompt | 9.30 s | 5.09 s | **3.23 s** | `4facfc896f6f` |
+| 4 same prompt (full hit) | 2.95 s | 2.94 s | 2.94 s | `4facfc896f6f` |
+
+- All md5s are unchanged, and generations 1 and 3 still hit the fox-fast gate.
+- Resident encode is 0.04–0.11 s against a 4.5 s stage-and-encode.
+- A rebind is 0.16 s against a 1.8 s load.
+- With a `--first` anchor (fox-s2 knobs), the rebound second prompt matches a
+  single-shot run of that prompt (`643592f49569`).
+- `h3_cuda_text_smoke full` now also checks resident output against streaming
+  output, byte for byte.
+
+VRAM: the encoder holds 46.9 GiB next to the DiT (18.3 GiB) and the video
+decoder (9.5 GiB). The encoder is kept only on a discrete GPU with at least
+46.9 + `H3_TEXT_RESIDENT_RESERVE_GIB` (default 32) GiB free.
+`H3_TEXT_RESIDENT=0` streams as before, and `=1` skips the check. If an
+allocation fails while the encoder is held, the request releases it and
+retries once. Single-shot `-p` runs are unchanged: they stream and exit.
+
+### REJECT: retuning loader staging for PCIe
+
+Single-shot fox-s2, two warm runs each. Qwen and the DiT load read from page
+cache. All runs give md5 `146495086e36`.
+
+| Setting | Qwen wall | DiT load | Wall |
+|---|---:|---:|---:|
+| default (128 MiB stage, 16 read threads, 8 lanes, depth 3) | 4.52 s | 1.35 s | 8.61–8.71 s |
+| `H3_LOAD_STAGE_MIB=64` | 4.33–4.37 s | 1.25–1.27 s | 8.44–8.53 s |
+| `H3_LOAD_STAGE_MIB=256` | 4.64–4.66 s | 1.28–1.30 s | 8.72–8.74 s |
+| `H3_LOAD_STAGE_MIB=512` | 4.76–4.80 s | 1.29–1.35 s | 8.87–9.02 s |
+| `H3_LOAD_STAGE_MIB=1024` | 5.15–5.17 s | 1.32–1.40 s | 9.51–9.58 s |
+| `H3_LOAD_READ_THREADS=8` / `=4` | 4.45 / 4.41 s | 1.35 / 1.37 s | 8.56–8.60 s |
+| `H3_QWEN_PREFETCH=4`, depth 1 or 6 | 4.50–4.52 s | 1.33–1.35 s | 8.58–8.68 s |
+
+Every setting is within about 4% of the default, and larger stages are slower.
+The Qwen stage rate is about 10.5 GiB/s whatever the fan-out. A single `dd` of
+one shard from page cache reads at 11.7–13.3 GB/s. So on this host the load is
+bound by copying out of the page cache (dual-channel DDR5), not by the stage
+size, the thread count or PCIe. `H3_LOAD_STAGE_MIB=64` is ~2% on wall, but it
+costs the video VAE ~0.1 s and is too close to the noise to change the
+default. The fix that works is not loading at all: see the session reuse above.
+
 ## 2026-09-17 — SM120 first baseline (RTX PRO 6000 Blackwell Max-Q)
 
 Unmodified v0.2.2 kernels built with `CUDA_ARCH=120` (`f8da0c3`). Setup:

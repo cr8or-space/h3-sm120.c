@@ -93,6 +93,36 @@ int main(int argc, char **argv) {
         fail("text encoder output is not deterministic");
     }
 
+    if (full_layers) {
+        /* Resident weights must reproduce the streaming output exactly, and
+         * keep doing so on a second encode with the same weights. */
+        h3_text_encoder *encoder = h3_text_encoder_load(
+            weights_path, "h3_shaders.metal", NULL, NULL,
+            error, sizeof(error));
+        if (!encoder) {
+            h3_text_embedding_free(&first);
+            h3_text_embedding_free(&second);
+            fail(error);
+        }
+        if (!h3_text_encoder_matches(encoder, weights_path))
+            fail("resident text encoder does not match its own directory");
+        for (int pass = 0; pass < 2; pass++) {
+            h3_text_embedding resident;
+            if (!h3_text_encoder_encode(encoder, token_ids, token_count,
+                                        NULL, NULL, &resident,
+                                        error, sizeof(error)))
+                fail(error);
+            if (resident.tokens != first.tokens ||
+                resident.width != first.width ||
+                memcmp(resident.values, first.values,
+                       elements * sizeof(*first.values)) != 0)
+                fail("resident text encoder differs from streaming");
+            h3_text_embedding_free(&resident);
+        }
+        h3_text_encoder_free(encoder);
+        puts("ok: resident text encoder matches streaming bit for bit");
+    }
+
     printf("cuda text smoke: %zu tokens, %d layer(s), hash %016llx, "
            "%.2f MiB peak, %llu direct, %llu submissions\n",
            first.tokens, layer_count, (unsigned long long)first_hash,
