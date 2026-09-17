@@ -167,10 +167,12 @@ Inherited performance discipline:
 - A default-path optimization is KEEP only if fox-fast stays bit-identical, or
   measures **PSNR ≥ 24 dB and SSIM ≥ 0.85** against the reference. Otherwise
   it is opt-in or REJECT. Record KEEP/REJECT with numbers.
-- The GB10 fox-fast md5 `f5282774d3a4` is the bit gate on GB10. SM120 may
-  choose different cuBLASLt algorithms, so first record an SM120 reference MP4
-  and md5 from the unmodified tree, then gate against that.
-- `docs/PERF_BASELINE.md` is an append-only dated log (GB10 so far). Add
+- The SM120 bit gate is fox-fast md5 prefix **`4facfc896f6f`** (fox-s2
+  `146495086e36`), recorded from unmodified v0.2.2 kernels on 2026-09-17. It
+  is deterministic run to run. GB10's `f5282774d3a4` does not apply here,
+  because cuBLASLt picks different algorithms. The first SM120 table in
+  `docs/PERF_BASELINE.md` has the warm walls and phase splits to compare against.
+- `docs/PERF_BASELINE.md` is a dated log, newest sections at the top. Add
   SM120 measurements as new dated sections labelled with the GPU. Don't
   rewrite GB10 history. `H3_VERSION` lives in `h3.h`; releases are cut in
   `CHANGELOG.md`.

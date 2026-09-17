@@ -4,6 +4,58 @@ Dated optimization log on **NVIDIA DGX Spark (GB10)**. **v0.2.2** shipping
 numbers are in the snapshots below. The 2026-08-17 tables after them are the
 **pre-optimization** CUDA baseline (`483ffdf` / `v0.1.0`), not shipping speed.
 
+SM120 (RTX PRO 6000 Blackwell Max-Q) sections are labelled as such. Every
+other section in this file is GB10.
+
+## 2026-09-17 — SM120 first baseline (RTX PRO 6000 Blackwell Max-Q)
+
+Unmodified v0.2.2 kernels built with `CUDA_ARCH=120` (`f8da0c3`). Setup:
+- 96 GB GDDR7, 300 W cap, x86_64 host with 92 GiB RAM.
+- CUDA 13.4, driver 595.
+- Weights on network storage behind fscache.
+
+All presets use seed 42 and `--profile`. Walls are warm repeats: runs 2–3 of 3
+are identical, and run 1 pays the page cache. All three runs produced the same
+md5, so the SM120 path is deterministic run to run. The pixels differ from GB10
+(expected with different cuBLASLt algorithms). A fox-fast frame is visually
+the same quality class as the GB10 showcase clip.
+
+| Preset | GB10 E2E | **SM120 E2E** | GB10 denoise (sdpa / linear) | **SM120 denoise** (sdpa / linear) | SM120 md5 prefix |
+|---|---:|---:|---|---|---|
+| fox-s2 (512² 22f, steps 2, L35 R1) | 8.2 s | **8.6 s** | 1.20 s (0.20 / 0.77) | **0.29 s** (0.06 / 0.17) | `146495086e36` |
+| fox-fast (512² 22f, steps 20, L45 R2) | 15.6 s | **11.2 s** | 8.17 s (1.40 / 5.22) | **2.12 s** (0.48 / 1.27) | `4facfc896f6f` |
+| 15 s (864×480, steps 20, L45 R2)* | 1076 s | **288 s** | 988 s (845 / 110) | **256 s** (214 / 34) | `567a0386480f` |
+
+\* The 15 s row uses a stand-in prompt, because the HIP-page office prompt is
+not in the repo. Timing depends on the knobs, not the text. The stand-in:
+"A quiet modern office at golden hour. The camera slowly dollies past desks as
+a woman types, looks up, and smiles at a colleague. Warm cinematic light,
+shallow depth of field, soft keyboard clicks and distant city ambience."
+
+SM120 phase split (warm):
+
+| Phase | fox-s2 | fox-fast | 15 s |
+|---|---:|---:|---:|
+| Qwen text encoder (46.86 GiB staged per run) | 4.49 s | 5.13 s | 6.10 s |
+| DiT load (INT8 cache, 14–18 GiB) | 1.34 s | 1.77 s | 1.80 s |
+| Denoise | 0.29 s | 2.12 s | 256.4 s |
+| Audio VAE | 0.15 s | 0.15 s | 0.42 s |
+| Video VAE | 1.48 s | 1.46 s | 22.1 s |
+| Peak live GPU | 12.9 GiB | 16.8 GiB | 23.2 GiB |
+
+What this means:
+- Denoise is **3.9×** faster than GB10 on both fox-fast and 15 s. Within it,
+  linear is 4.1× faster and long-N SDPA 3.9× faster.
+- The short-clip wall is no longer the DiT. On fox-fast, Qwen alone is 46% of
+  wall and is load/stage-bound (GPU linear is only 0.35 s).
+- On 15 s, SDPA is still 74% of wall.
+- VRAM is far from binding: peak is 23 GiB of 96.
+
+Tests on the same build all pass:
+- `make test`: 2 min 7 s, with no skips. The first run pays network loads.
+- `test-step`: 18 min, a cold transformer load over the network.
+- `test-conditional`: 9 min 44 s (`--ref-video` skipped).
+
 ## perf2 autoloop (2026-09-07)
 
 Branch `perf2`. Wall budget **10 h** from 06:49 +0800 (stop ~16:49). Primary
