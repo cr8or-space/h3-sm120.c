@@ -9496,4 +9496,23 @@ void h3_gpu_profile_mark(h3_gpu *gpu, const char *phase) {
     gpu->profile_mark_wall = h3_gpu_now();
 }
 
+void h3_gpu_profile_restart(h3_gpu *gpu) {
+    if (!gpu) return;
+    gpu->profile_mark_stats = gpu->stats;
+    gpu->profile_mark_wall = h3_gpu_now();
+}
+
+int h3_gpu_memory_info(uint64_t *free_bytes, uint64_t *total_bytes,
+                       int *integrated) {
+    size_t available = 0, total = 0;
+    cudaDeviceProp props;
+    if (cudaMemGetInfo(&available, &total) != cudaSuccess ||
+        cudaGetDeviceProperties(&props, 0) != cudaSuccess)
+        return 0;
+    if (free_bytes) *free_bytes = available;
+    if (total_bytes) *total_bytes = total;
+    if (integrated) *integrated = props.integrated;
+    return 1;
+}
+
 } /* extern "C" */

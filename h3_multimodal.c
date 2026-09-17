@@ -148,7 +148,8 @@ static int append_vision(h3_ids *ids, h3_text_vision_span *span,
     return 1;
 }
 
-static int encode_presentation(const char *weight_directory,
+static int encode_presentation(h3_text_encoder *encoder,
+                               const char *weight_directory,
                                const char *shader_source_path,
                                h3_ids *ids, h3_text_vision_span *spans,
                                const h3_vision_output *const *visions,
@@ -186,16 +187,21 @@ static int encode_presentation(const char *weight_directory,
         free(positions); free(tags);
         return 0;
     }
-    int ok = h3_text_encode_multimodal_bf16(
-        weight_directory, shader_source_path, ids->values, ids->count,
-        spans, span_count, positions, tags, progress, progress_opaque,
-        output, error, error_size);
+    int ok = encoder ?
+        h3_text_encoder_encode_multimodal(
+            encoder, ids->values, ids->count, spans, span_count, positions,
+            tags, progress, progress_opaque, output, error, error_size) :
+        h3_text_encode_multimodal_bf16(
+            weight_directory, shader_source_path, ids->values, ids->count,
+            spans, span_count, positions, tags, progress, progress_opaque,
+            output, error, error_size);
     free(positions); free(tags);
     return ok;
 }
 
 int h3_multimodal_encode_fl2va_bf16(
                         const h3_tokenizer *tokenizer,
+                        h3_text_encoder *encoder,
                         const char *weight_directory,
                         const char *shader_source_path,
                         const char *prompt,
@@ -205,7 +211,8 @@ int h3_multimodal_encode_fl2va_bf16(
                         char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (output) memset(output, 0, sizeof(*output));
-    if (!tokenizer || !weight_directory || !shader_source_path || !prompt ||
+    if (!tokenizer ||
+        (!encoder && (!weight_directory || !shader_source_path)) || !prompt ||
         !*prompt || !images || !image_count || !output) {
         fail(error, error_size, "invalid FL2VA multimodal presentation arguments");
         return 0;
@@ -226,7 +233,7 @@ int h3_multimodal_encode_fl2va_bf16(
                            error, error_size)) goto cleanup;
     }
     if (!tokenize_append(tokenizer, prompt, &ids, error, error_size)) goto cleanup;
-    ok = encode_presentation(weight_directory, shader_source_path,
+    ok = encode_presentation(encoder, weight_directory, shader_source_path,
         &ids, spans, visions, image_count, progress, progress_opaque,
         output, error, error_size);
     goto cleanup;
@@ -242,6 +249,7 @@ cleanup:
 
 int h3_multimodal_encode_ref2va_bf16(
                         const h3_tokenizer *tokenizer,
+                        h3_text_encoder *encoder,
                         const char *weight_directory,
                         const char *shader_source_path,
                         const char *prompt,
@@ -252,7 +260,8 @@ int h3_multimodal_encode_ref2va_bf16(
                         char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (output) memset(output, 0, sizeof(*output));
-    if (!tokenizer || !weight_directory || !shader_source_path || !prompt ||
+    if (!tokenizer ||
+        (!encoder && (!weight_directory || !shader_source_path)) || !prompt ||
         !*prompt || !references || !reference_count || !output) {
         fail(error, error_size, "invalid Ref2VA presentation arguments");
         return 0;
@@ -338,7 +347,7 @@ int h3_multimodal_encode_ref2va_bf16(
         !tokenize_append(tokenizer, prompt, &ids, error, error_size))
         goto cleanup;
     {
-        int ok = encode_presentation(weight_directory, shader_source_path,
+        int ok = encode_presentation(encoder, weight_directory, shader_source_path,
             &ids, spans, visions, span_count, progress, progress_opaque,
             output, error, error_size);
         free(ids.values); free(spans); free(visions);

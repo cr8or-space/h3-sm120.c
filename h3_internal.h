@@ -31,6 +31,8 @@ struct h3_ctx {
     struct h3_dit *dit;
     char *video_decoder_key;
     struct h3_video_vae_decoder *video_decoder;
+    struct h3_text_encoder *text_encoder;
+    int text_encoder_refused;
 };
 
 void h3_set_error(h3_ctx *ctx, const char *format, ...)

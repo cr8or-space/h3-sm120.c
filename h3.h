@@ -25,6 +25,7 @@ typedef struct {
     size_t embedding_bytes;
     int prepared_dit;
     int video_decoder;
+    int text_encoder;
 } h3_cache_info;
 
 typedef enum {
@@ -184,7 +185,10 @@ const h3_model_info *h3_model(const h3_ctx *ctx);
 /* Interactive-session reuse. Disabled by default so one-shot callers retain
  * the original phase-by-phase memory lifetime. */
 void h3_cache_set_enabled(h3_ctx *ctx, int enabled);
+/* Drops request-shaped state: conditioning, prepared DiT and video decoder. */
 void h3_cache_clear(h3_ctx *ctx);
+/* h3_cache_clear plus the resident text encoder. */
+void h3_cache_release(h3_ctx *ctx);
 void h3_cache_get_info(const h3_ctx *ctx, h3_cache_info *info);
 
 /* Generate media, delivering decoded frames incrementally through on_frame. */

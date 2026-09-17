@@ -28,11 +28,45 @@ typedef struct {
     const uint16_t *deepstack[3];
 } h3_text_vision_span;
 
+/* The same 50 language layers held on the GPU across encodes. The streaming
+ * functions below read every layer from the checkpoint on every call, which
+ * keeps peak memory near one layer but costs ~47 GiB of staging per prompt.
+ * A resident encoder pays that once; its outputs are bit-identical. */
+typedef struct h3_text_encoder h3_text_encoder;
+
+/* Bytes of GPU memory a resident encoder holds for its weights. */
+uint64_t h3_text_encoder_resident_bytes(void);
+h3_text_encoder *h3_text_encoder_load(const char *weight_directory,
+                                      const char *shader_source_path,
+                                      h3_text_progress progress,
+                                      void *progress_opaque,
+                                      char *error, size_t error_size);
+void h3_text_encoder_free(h3_text_encoder *encoder);
+/* True when the encoder was loaded from the same checkpoint files as
+ * weight_directory (FL2VA and Ref2VA share one set of Qwen blobs). */
+int h3_text_encoder_matches(const h3_text_encoder *encoder,
+                            const char *weight_directory);
+
 /* Run the released first 50 Qwen3-VL language layers. The caller owns the
  * returned BF16 values and releases them with h3_text_embedding_free(). */
 int h3_text_encode_bf16(const char *weight_directory,
                         const char *shader_source_path,
                         const uint32_t *token_ids, size_t token_count,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        char *error, size_t error_size);
+
+/* Resident forms of h3_text_encode_bf16 and h3_text_encode_multimodal_bf16. */
+int h3_text_encoder_encode(h3_text_encoder *encoder,
+                           const uint32_t *token_ids, size_t token_count,
+                           h3_text_progress progress, void *progress_opaque,
+                           h3_text_embedding *output,
+                           char *error, size_t error_size);
+int h3_text_encoder_encode_multimodal(
+                        h3_text_encoder *encoder,
+                        const uint32_t *token_ids, size_t token_count,
+                        const h3_text_vision_span *spans, size_t span_count,
+                        const uint32_t *position_ids, const uint8_t *tags,
                         h3_text_progress progress, void *progress_opaque,
                         h3_text_embedding *output,
                         char *error, size_t error_size);

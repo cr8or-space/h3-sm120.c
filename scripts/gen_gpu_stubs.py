@@ -9,7 +9,7 @@ HEADER = ROOT / "h3_gpu.h"
 OUTPUT = ROOT / "h3_gpu_stubs.c"
 
 IMPLEMENTED = {
-    "h3_gpu_create", "h3_gpu_free", "h3_gpu_is_m5", "h3_gpu_has_nax_mlp",
+    "h3_gpu_create", "h3_gpu_free", "h3_gpu_memory_info", "h3_gpu_is_m5", "h3_gpu_has_nax_mlp",
     "h3_gpu_has_int8_mlp", "h3_gpu_tensor_new_f32", "h3_gpu_tensor_new_bf16",
     "h3_gpu_tensor_new_i8", "h3_gpu_tensor_from_f32", "h3_gpu_tensor_from_bf16",
     "h3_gpu_tensor_from_u32", "h3_gpu_tensor_load_bf16", "h3_gpu_tensor_load_f32",

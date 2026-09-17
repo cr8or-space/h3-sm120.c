@@ -120,6 +120,14 @@ int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats);
  * print wall time alongside command-buffer GPU time and allocation counters. */
 void h3_gpu_profile_set_label(h3_gpu *gpu, const char *label);
 void h3_gpu_profile_mark(h3_gpu *gpu, const char *phase);
+/* Restart the mark interval without printing, for a context that sits idle
+ * between uses. */
+void h3_gpu_profile_restart(h3_gpu *gpu);
+/* Device memory as the allocator sees it. integrated is nonzero when the GPU
+ * shares physical memory with the host, where free device memory is not a
+ * budget that can be spent without starving the host. */
+int h3_gpu_memory_info(uint64_t *free_bytes, uint64_t *total_bytes,
+                       int *integrated);
 
 int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input, const h3_gpu_tensor *weight,

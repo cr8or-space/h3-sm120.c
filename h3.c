@@ -133,9 +133,17 @@ void h3_cache_clear(h3_ctx *ctx) {
     ctx->video_decoder_key = NULL;
 }
 
+void h3_cache_release(h3_ctx *ctx) {
+    if (!ctx) return;
+    h3_cache_clear(ctx);
+    h3_text_encoder_free(ctx->text_encoder);
+    ctx->text_encoder = NULL;
+    ctx->text_encoder_refused = 0;
+}
+
 void h3_cache_set_enabled(h3_ctx *ctx, int enabled) {
     if (!ctx) return;
-    if (!enabled) h3_cache_clear(ctx);
+    if (!enabled) h3_cache_release(ctx);
     ctx->cache_enabled = enabled != 0;
 }
 
@@ -156,6 +164,7 @@ void h3_cache_get_info(const h3_ctx *ctx, h3_cache_info *info) {
     }
     info->prepared_dit = ctx->dit != NULL;
     info->video_decoder = ctx->video_decoder != NULL;
+    info->text_encoder = ctx->text_encoder != NULL;
 }
 
 static int h3_key_append(h3_key *key, const char *format, ...) {
@@ -536,7 +545,7 @@ h3_ctx *h3_load_dir(const char *model_dir) {
 
 void h3_free(h3_ctx *ctx) {
     if (!ctx) return;
-    h3_cache_clear(ctx);
+    h3_cache_release(ctx);
     free(ctx->model_dir);
     free(ctx);
 }
@@ -735,6 +744,78 @@ static void h3_text_progress_bridge(int completed, int total, void *opaque) {
     h3_progress_emit(opaque, "text encoder", completed, total);
 }
 
+static void h3_text_load_progress_bridge(int completed, int total,
+                                         void *opaque) {
+    h3_progress_emit(opaque, "text encoder load", completed, total);
+}
+
+static int h3_env_gib(const char *name, int fallback) {
+    const char *value = getenv(name);
+    if (!value || !*value) return fallback;
+    char *tail = NULL;
+    long parsed = strtol(value, &tail, 10);
+    return tail != value && !*tail && parsed >= 0 && parsed <= 4096 ?
+        (int)parsed : fallback;
+}
+
+/* A session keeps the Qwen language weights on the GPU, so a new prompt skips
+ * restaging ~47 GiB. That only pays on a discrete card with room left for the
+ * DiT, the VAEs and long-clip activations beside it; on shared memory the
+ * weights would come out of the host's page cache. H3_TEXT_RESIDENT=0 always
+ * streams, =1 skips the memory check. NULL means stream this request. */
+static h3_text_encoder *h3_acquire_text_encoder(
+        h3_ctx *ctx, const char *text_path, h3_generation_progress *progress) {
+    const char *setting = getenv("H3_TEXT_RESIDENT");
+    int forced = setting && !strcmp(setting, "1");
+    if (!ctx->cache_enabled || (setting && !strcmp(setting, "0"))) {
+        h3_text_encoder_free(ctx->text_encoder);
+        ctx->text_encoder = NULL;
+        return NULL;
+    }
+    if (ctx->text_encoder) {
+        if (h3_text_encoder_matches(ctx->text_encoder, text_path)) {
+            fprintf(stderr, "h3: text encoder resident hit\n");
+            return ctx->text_encoder;
+        }
+        h3_text_encoder_free(ctx->text_encoder);
+        ctx->text_encoder = NULL;
+    }
+    if (ctx->text_encoder_refused) return NULL;
+    uint64_t need = h3_text_encoder_resident_bytes();
+    uint64_t available = 0, total = 0;
+    int integrated = 1;
+    if (!forced) {
+        uint64_t reserve =
+            (uint64_t)h3_env_gib("H3_TEXT_RESIDENT_RESERVE_GIB", 32) << 30;
+        if (!h3_gpu_memory_info(&available, &total, &integrated) ||
+            integrated || available < need + reserve) {
+            fprintf(stderr,
+                    "h3: text encoder streams per prompt (%s, %.1f GiB free, "
+                    "resident needs %.1f + %.1f GiB)\n",
+                    integrated ? "shared memory" : "discrete",
+                    (double)available / (1u << 30),
+                    (double)need / (1u << 30), (double)reserve / (1u << 30));
+            ctx->text_encoder_refused = 1;
+            return NULL;
+        }
+    }
+    char detail[512];
+    h3_progress_emit(progress, "text encoder load", 0, 50);
+    ctx->text_encoder = h3_text_encoder_load(
+        text_path, "h3_shaders.metal", h3_text_load_progress_bridge, progress,
+        detail, sizeof(detail));
+    if (!ctx->text_encoder) {
+        fprintf(stderr,
+                "h3: warning: resident text encoder failed (%s); streaming\n",
+                detail);
+        ctx->text_encoder_refused = 1;
+        return NULL;
+    }
+    fprintf(stderr, "h3: text encoder resident miss; %.1f GiB retained\n",
+            (double)need / (1u << 30));
+    return ctx->text_encoder;
+}
+
 static void h3_dit_progress_bridge(const char *phase, int completed, int total,
                                    void *opaque) {
     h3_progress_emit(opaque, phase, completed, total);
@@ -924,8 +1005,8 @@ static float *h3_extract_vision_pair(const float *pixels, int frames,
     return pair;
 }
 
-h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
-                       const h3_params *params) {
+static h3_result *h3_generate_once(h3_ctx *ctx, const char *prompt,
+                                   const h3_params *params) {
     if (!ctx) return NULL;
     ctx->error[0] = '\0';
     if (!prompt || !*prompt) {
@@ -1487,14 +1568,17 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "Qwen reference vision count mismatch");
             goto cleanup;
         }
+        h3_text_encoder *resident =
+            h3_acquire_text_encoder(ctx, text_path, &progress);
+        if (progress.cancelled) goto cleanup;
         h3_progress_emit(&progress, "text encoder", 0, 50);
         int text_ok = ref2va ? h3_multimodal_encode_ref2va_bf16(
-                tokenizer, text_path, "h3_shaders.metal", prompt,
+                tokenizer, resident, text_path, "h3_shaders.metal", prompt,
                 presentations, params->reference_count,
                 h3_text_progress_bridge, &progress, &text,
                 detail, sizeof(detail)) :
             h3_multimodal_encode_fl2va_bf16(
-                tokenizer, text_path, "h3_shaders.metal", prompt,
+                tokenizer, resident, text_path, "h3_shaders.metal", prompt,
                 vision_outputs, visual_count,
                 h3_text_progress_bridge, &progress, &text,
                 detail, sizeof(detail));
@@ -1510,11 +1594,18 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
         }
+        h3_text_encoder *resident =
+            h3_acquire_text_encoder(ctx, text_path, &progress);
+        if (progress.cancelled) goto cleanup;
         h3_progress_emit(&progress, "text encoder", 0, 50);
-        if (!h3_text_encode_bf16(
-                text_path, "h3_shaders.metal", ids, token_count,
-                h3_text_progress_bridge, &progress, &text,
-                detail, sizeof(detail))) {
+        if (!(resident ?
+              h3_text_encoder_encode(
+                  resident, ids, token_count, h3_text_progress_bridge,
+                  &progress, &text, detail, sizeof(detail)) :
+              h3_text_encode_bf16(
+                  text_path, "h3_shaders.metal", ids, token_count,
+                  h3_text_progress_bridge, &progress, &text,
+                  detail, sizeof(detail)))) {
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
         }
@@ -1828,4 +1919,21 @@ cleanup:
 
 void h3_result_free(h3_result *result) {
     free(result);
+}
+
+/* The resident text encoder is the one cache a request cannot evict on its
+ * own, so an allocation failure while it is held gets one retry without it.
+ * The conditioning cache already holds this prompt's embedding by then. */
+h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
+                       const h3_params *params) {
+    h3_result *result = h3_generate_once(ctx, prompt, params);
+    if (result || !ctx || !ctx->text_encoder ||
+        (!strstr(ctx->error, "memory") && !strstr(ctx->error, "allocate")))
+        return result;
+    fprintf(stderr,
+            "h3: %s; releasing the resident text encoder and retrying\n",
+            ctx->error);
+    h3_cache_release(ctx);
+    ctx->text_encoder_refused = 1;
+    return h3_generate_once(ctx, prompt, params);
 }

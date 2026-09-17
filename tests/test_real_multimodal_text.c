@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
             tokenizer_path, error, sizeof(error));
         if (!tokenizer) die(error);
         int ok = h3_multimodal_encode_fl2va_bf16(
-            tokenizer, weights, "h3_shaders.metal",
+            tokenizer, NULL, weights, "h3_shaders.metal",
             "A red fox walking through snow", &vision_output, 1,
             progress, NULL, &got, error, sizeof(error));
         h3_tokenizer_free(tokenizer);

@@ -471,7 +471,16 @@ void h3_text_embedding_free(h3_text_embedding *embedding) {
     memset(embedding, 0, sizeof(*embedding));
 }
 
+struct h3_text_encoder {
+    h3_gpu *gpu;
+    h3_weight_store *store;
+    char *identity;
+    h3_gpu_tensor *embedding;
+    text_layer_weights layers[TEXT_LAYERS];
+};
+
 static int text_encode_bf16_impl(
+                        h3_text_encoder *encoder,
                         const char *weight_directory,
                         const char *shader_source_path,
                         const uint32_t *token_ids, size_t token_count,
@@ -482,7 +491,8 @@ static int text_encode_bf16_impl(
                         h3_text_embedding *output,
                         char *error, size_t error_size) {
     if (output) memset(output, 0, sizeof(*output));
-    if (!weight_directory || !shader_source_path || !token_ids || !token_count ||
+    if ((!encoder && (!weight_directory || !shader_source_path)) ||
+        !token_ids || !token_count ||
         !output || token_count > UINT32_MAX ||
         layer_count < 1 || layer_count > TEXT_LAYERS ||
         token_count > UINT32_MAX / TEXT_HIDDEN ||
@@ -514,15 +524,22 @@ static int text_encode_bf16_impl(
         span_cursor = span->start + span->tokens;
     }
 
-    h3_weight_store *store = h3_weight_store_open(weight_directory, error,
-                                                   error_size);
-    if (!store) return 0;
-    h3_gpu *gpu = h3_gpu_create(shader_source_path, error, error_size);
-    if (!gpu) {
-        h3_weight_store_free(store);
-        return 0;
+    h3_weight_store *store = NULL;
+    h3_gpu *gpu = NULL;
+    if (encoder) {
+        store = encoder->store;
+        gpu = encoder->gpu;
+        h3_gpu_profile_restart(gpu);
+    } else {
+        store = h3_weight_store_open(weight_directory, error, error_size);
+        if (!store) return 0;
+        gpu = h3_gpu_create(shader_source_path, error, error_size);
+        if (!gpu) {
+            h3_weight_store_free(store);
+            return 0;
+        }
+        h3_gpu_profile_set_label(gpu, "Qwen text encoder");
     }
-    h3_gpu_profile_set_label(gpu, "Qwen text encoder");
     load_context load = {store, gpu, {NULL}, 0, error, error_size};
     uint32_t tokens = (uint32_t)token_count;
     size_t hidden_count = token_count * TEXT_HIDDEN;
@@ -536,8 +553,10 @@ static int text_encode_bf16_impl(
         fail(error, error_size, "out of memory allocating Qwen RoPE tables");
         free(cosines);
         free(sines);
-        h3_gpu_free(gpu);
-        h3_weight_store_free(store);
+        if (!encoder) {
+            h3_gpu_free(gpu);
+            h3_weight_store_free(store);
+        }
         return 0;
     }
     float inverse_frequency[TEXT_ROPE_HALF];
@@ -620,7 +639,7 @@ static int text_encode_bf16_impl(
         goto cleanup;
     }
 
-    h3_gpu_tensor *embedding_weight = load_2d(
+    h3_gpu_tensor *embedding_weight = encoder ? encoder->embedding : load_2d(
         &load, "model.language_model.embed_tokens.weight", TEXT_VOCAB,
         TEXT_HIDDEN);
     if (!embedding_weight) goto cleanup;
@@ -645,14 +664,15 @@ static int text_encode_bf16_impl(
         }
     }
 
-    int prefetch_threads = text_prefetch_threads();
+    int prefetch_threads = encoder ? 0 : text_prefetch_threads();
     int prefetch_layers = prefetch_threads > 0 && layer_count > 1;
     int prefetch_depth = prefetch_layers ? text_prefetch_depth(gpu) : 0;
     text_prefetch_slot slots[6];
     memset(slots, 0, sizeof(slots));
     text_layer_weights weights;
     memset(&weights, 0, sizeof(weights));
-    if (!layer_weights_load(&load, 0, &weights)) goto cleanup;
+    if (encoder) weights = encoder->layers[0];
+    else if (!layer_weights_load(&load, 0, &weights)) goto cleanup;
     int next_prefetch_layer = 1;
     for (int index = 0;
          index < prefetch_depth && next_prefetch_layer < layer_count;
@@ -689,7 +709,9 @@ static int text_encode_bf16_impl(
         if (layer + 1 >= layer_count) continue;
 
         memset(&weights, 0, sizeof(weights));
-        if (prefetch_layers) {
+        if (encoder) {
+            weights = encoder->layers[layer + 1];
+        } else if (prefetch_layers) {
             text_prefetch_slot *next = NULL;
             for (int index = 0; index < prefetch_depth; index++) {
                 if (slots[index].occupied &&
@@ -744,6 +766,7 @@ static int text_encode_bf16_impl(
         memcpy(output->tags, tags, token_count * sizeof(*output->tags));
     }
     ok = 1;
+    if (encoder) h3_gpu_profile_mark(gpu, "encode");
     goto finished;
 
 cleanup:
@@ -754,8 +777,10 @@ finished:
          index++) {
         h3_gpu_tensor_free(activations[index]);
     }
-    h3_gpu_free(gpu);
-    h3_weight_store_free(store);
+    if (!encoder) {
+        h3_gpu_free(gpu);
+        h3_weight_store_free(store);
+    }
     return ok;
 
 early_cleanup:
@@ -775,8 +800,10 @@ early_cleanup:
     for (size_t index = 0; index < 3; index++)
         h3_gpu_tensor_free(deepstack[index]);
     retire_deferred(&load);
-    h3_gpu_free(gpu);
-    h3_weight_store_free(store);
+    if (!encoder) {
+        h3_gpu_free(gpu);
+        h3_weight_store_free(store);
+    }
     return 0;
 }
 
@@ -787,7 +814,7 @@ int h3_text_encode_bf16(const char *weight_directory,
                         h3_text_embedding *output,
                         char *error, size_t error_size) {
     return text_encode_bf16_impl(
-        weight_directory, shader_source_path, token_ids, token_count,
+        NULL, weight_directory, shader_source_path, token_ids, token_count,
         NULL, 0, NULL, NULL, TEXT_LAYERS, progress, progress_opaque,
         output, error, error_size);
 }
@@ -801,7 +828,7 @@ int h3_text_encode_layers_bf16(
                         h3_text_embedding *output,
                         char *error, size_t error_size) {
     return text_encode_bf16_impl(
-        weight_directory, shader_source_path, token_ids, token_count,
+        NULL, weight_directory, shader_source_path, token_ids, token_count,
         NULL, 0, NULL, NULL, layer_count, progress, progress_opaque,
         output, error, error_size);
 }
@@ -821,7 +848,7 @@ int h3_text_encode_multimodal_bf16(
         return 0;
     }
     return text_encode_bf16_impl(
-        weight_directory, shader_source_path, token_ids, token_count,
+        NULL, weight_directory, shader_source_path, token_ids, token_count,
         spans, span_count, position_ids, tags, TEXT_LAYERS,
         progress, progress_opaque,
         output, error, error_size);
@@ -843,7 +870,185 @@ int h3_text_encode_multimodal_layers_bf16(
         return 0;
     }
     return text_encode_bf16_impl(
-        weight_directory, shader_source_path, token_ids, token_count,
+        NULL, weight_directory, shader_source_path, token_ids, token_count,
         spans, span_count, position_ids, tags, layer_count,
         progress, progress_opaque, output, error, error_size);
+}
+
+uint64_t h3_text_encoder_resident_bytes(void) {
+    uint64_t layer = 2 * (uint64_t)TEXT_HIDDEN + 2 * (uint64_t)TEXT_HEAD_DIM +
+        (uint64_t)TEXT_HIDDEN * (2 * (uint64_t)TEXT_QUERY_DIM +
+                                 2 * (uint64_t)TEXT_KV_DIM +
+                                 3 * (uint64_t)TEXT_INTERMEDIATE);
+    return 2 * ((uint64_t)TEXT_VOCAB * TEXT_HIDDEN + TEXT_LAYERS * layer);
+}
+
+/* HF snapshots link both pipelines' text_encoder files to one blob, so the
+ * resolved index names the checkpoint rather than the directory. */
+static char *text_encoder_identity(const char *weight_directory) {
+    size_t size = strlen(weight_directory) +
+                  sizeof("/model.safetensors.index.json");
+    char *index = malloc(size);
+    if (!index) return NULL;
+    snprintf(index, size, "%s/model.safetensors.index.json", weight_directory);
+    char *resolved = realpath(index, NULL);
+    free(index);
+    return resolved ? resolved : realpath(weight_directory, NULL);
+}
+
+void h3_text_encoder_free(h3_text_encoder *encoder) {
+    if (!encoder) return;
+    h3_gpu_tensor_free(encoder->embedding);
+    for (int layer = 0; layer < TEXT_LAYERS; layer++) {
+        text_layer_weights *weights = &encoder->layers[layer];
+        h3_gpu_tensor *fields[] = {
+            weights->input_norm, weights->query, weights->key, weights->value,
+            weights->query_norm, weights->key_norm, weights->attention_output,
+            weights->post_norm, weights->gate, weights->up, weights->down
+        };
+        for (size_t index = 0; index < sizeof(fields) / sizeof(*fields);
+             index++)
+            h3_gpu_tensor_free(fields[index]);
+    }
+    h3_gpu_free(encoder->gpu);
+    h3_weight_store_free(encoder->store);
+    free(encoder->identity);
+    free(encoder);
+}
+
+int h3_text_encoder_matches(const h3_text_encoder *encoder,
+                            const char *weight_directory) {
+    if (!encoder || !weight_directory) return 0;
+    char *identity = text_encoder_identity(weight_directory);
+    int same = identity && encoder->identity &&
+               !strcmp(identity, encoder->identity);
+    free(identity);
+    return same;
+}
+
+h3_text_encoder *h3_text_encoder_load(const char *weight_directory,
+                                      const char *shader_source_path,
+                                      h3_text_progress progress,
+                                      void *progress_opaque,
+                                      char *error, size_t error_size) {
+    if (!weight_directory || !shader_source_path) {
+        fail(error, error_size, "invalid Qwen text encoder load arguments");
+        return NULL;
+    }
+    h3_text_encoder *encoder = calloc(1, sizeof(*encoder));
+    if (!encoder) {
+        fail(error, error_size, "out of memory creating Qwen text encoder");
+        return NULL;
+    }
+    load_context load = {NULL, NULL, {NULL}, 0, error, error_size};
+    encoder->identity = text_encoder_identity(weight_directory);
+    encoder->store = encoder->identity ?
+        h3_weight_store_open(weight_directory, error, error_size) : NULL;
+    if (!encoder->store) {
+        if (!encoder->identity)
+            fail(error, error_size, "cannot resolve %s", weight_directory);
+        goto failed;
+    }
+    encoder->gpu = h3_gpu_create(shader_source_path, error, error_size);
+    if (!encoder->gpu) goto failed;
+    h3_gpu_profile_set_label(encoder->gpu, "Qwen text encoder");
+    load.store = encoder->store;
+    load.gpu = encoder->gpu;
+    for (int layer = 0; layer < TEXT_LAYERS; layer++) {
+        if (!layer_weights_allocate(&load, &encoder->layers[layer]))
+            goto failed_deferred;
+    }
+    uint64_t shape[] = {TEXT_VOCAB, TEXT_HIDDEN};
+    encoder->embedding = h3_weight_load_bf16(
+        encoder->store, encoder->gpu,
+        "model.language_model.embed_tokens.weight", 2, shape,
+        error, error_size);
+    if (!encoder->embedding) goto failed_deferred;
+    /* Same read shape as the streaming ring: a few layers at once, each split
+     * across lanes that share the context's pinned staging slots. */
+    int lanes = text_prefetch_threads();
+    if (lanes < 1) lanes = 1;
+    int depth = text_prefetch_depth(encoder->gpu);
+    text_layer_prefetch jobs[6 * 8];
+    pthread_t threads[6 * 8];
+    int started[6 * 8];
+    for (int first = 0; first < TEXT_LAYERS; first += depth) {
+        int count = 0;
+        for (int layer = first; layer < first + depth && layer < TEXT_LAYERS;
+             layer++) {
+            for (int lane = 0; lane < lanes; lane++, count++) {
+                jobs[count] = (text_layer_prefetch){
+                    encoder->store, layer, &encoder->layers[layer],
+                    lane, lanes, 0, {0}};
+                started[count] = pthread_create(
+                    &threads[count], NULL, layer_prefetch_main,
+                    &jobs[count]) == 0;
+                if (!started[count]) layer_prefetch_main(&jobs[count]);
+            }
+        }
+        int ok = 1;
+        for (int index = 0; index < count; index++) {
+            if (started[index]) pthread_join(threads[index], NULL);
+            if (ok && !jobs[index].ok) {
+                ok = 0;
+                fail(error, error_size, "Qwen layer %d load failed: %s",
+                     jobs[index].layer,
+                     jobs[index].error[0] ? jobs[index].error : "unknown");
+            }
+        }
+        if (!ok) goto failed_deferred;
+        int loaded = first + depth < TEXT_LAYERS ? first + depth : TEXT_LAYERS;
+        if (progress) progress(loaded, TEXT_LAYERS, progress_opaque);
+    }
+    if (!h3_gpu_begin(encoder->gpu) || !h3_gpu_submit(encoder->gpu)) {
+        fail(error, error_size, "cannot finish Qwen weight upload: %s",
+             h3_gpu_error(encoder->gpu));
+        goto failed_deferred;
+    }
+    h3_gpu_profile_mark(encoder->gpu, "load");
+    return encoder;
+
+failed_deferred:
+    /* Layer tensors are owned through the registry until the load succeeds. */
+    retire_deferred(&load);
+    memset(encoder->layers, 0, sizeof(encoder->layers));
+failed:
+    h3_text_encoder_free(encoder);
+    return NULL;
+}
+
+int h3_text_encoder_encode(h3_text_encoder *encoder,
+                           const uint32_t *token_ids, size_t token_count,
+                           h3_text_progress progress, void *progress_opaque,
+                           h3_text_embedding *output,
+                           char *error, size_t error_size) {
+    if (!encoder) {
+        if (output) memset(output, 0, sizeof(*output));
+        fail(error, error_size, "resident Qwen text encoder is absent");
+        return 0;
+    }
+    return text_encode_bf16_impl(
+        encoder, NULL, NULL, token_ids, token_count, NULL, 0, NULL, NULL,
+        TEXT_LAYERS, progress, progress_opaque, output, error, error_size);
+}
+
+int h3_text_encoder_encode_multimodal(
+                        h3_text_encoder *encoder,
+                        const uint32_t *token_ids, size_t token_count,
+                        const h3_text_vision_span *spans, size_t span_count,
+                        const uint32_t *position_ids, const uint8_t *tags,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        char *error, size_t error_size) {
+    if (!encoder || !spans || !span_count || !position_ids || !tags) {
+        if (output) memset(output, 0, sizeof(*output));
+        fail(error, error_size, encoder ?
+             "multimodal Qwen presentation is incomplete" :
+             "resident Qwen text encoder is absent");
+        return 0;
+    }
+    return text_encode_bf16_impl(
+        encoder, NULL, NULL, token_ids, token_count, spans, span_count,
+        position_ids, tags, TEXT_LAYERS, progress, progress_opaque,
+        output, error, error_size);
 }

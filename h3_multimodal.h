@@ -11,9 +11,11 @@
  * Qwen vision outputs, then run the language decoder. FL2VA anchors and
  * image-only Ref2VA entries intentionally share this exact presentation.
  * Keeping the builder separate lets vision and text release their large
- * temporary weights independently. */
+ * temporary weights independently. A non-NULL encoder runs the language
+ * decoder from resident weights instead of streaming weight_directory. */
 int h3_multimodal_encode_fl2va_bf16(
                         const h3_tokenizer *tokenizer,
+                        h3_text_encoder *encoder,
                         const char *weight_directory,
                         const char *shader_source_path,
                         const char *prompt,
@@ -42,6 +44,7 @@ typedef struct {
  * labels and per-block video timestamps, then run the Qwen decoder. */
 int h3_multimodal_encode_ref2va_bf16(
                         const h3_tokenizer *tokenizer,
+                        h3_text_encoder *encoder,
                         const char *weight_directory,
                         const char *shader_source_path,
                         const char *prompt,
