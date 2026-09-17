@@ -7,6 +7,35 @@ numbers are in the snapshots below. The 2026-08-17 tables after them are the
 SM120 (RTX PRO 6000 Blackwell Max-Q) sections are labelled as such. Every
 other section in this file is GB10.
 
+## 2026-09-17 — SM120: the memory-pool release threshold is not worth tuning
+
+`h3_gpu_create` keeps 24 GiB of freed pool blocks resident, a value chosen on
+GB10 where the pool shared 128 GB with the host. `H3_GPU_POOL_RELEASE_GIB` now
+overrides it so it can be measured. Two warm runs each.
+
+fox-fast (`4facfc896f6f` throughout):
+
+| Threshold | Wall | Qwen | DiT load |
+|---|---:|---:|---:|
+| 0 GiB | 10.66 / 10.57 s | 4.521 s | 1.786 s |
+| 8 GiB | 10.54 / 10.59 s | 4.508 s | 1.782 s |
+| 24 GiB (shipping) | 10.60 / 10.59 s | 4.509 s | 1.782 s |
+| 48 GiB | 10.58 / 10.60 s | 4.514 s | 1.785 s |
+| 96 GiB | 10.63 / 10.63 s | 4.527 s | 1.789 s |
+
+Anchored fox-s2, which allocates and frees 12.4 GiB in the VAE encoder
+(`4bde49a56333` throughout):
+
+| Threshold | Wall | Encoder | VAE decode |
+|---|---:|---:|---:|
+| 0 GiB | 11.42 / 11.34 s | 2.453 s | 1.520 s |
+| 24 GiB (shipping) | 11.20 / 11.26 s | 2.452 s | 1.476 s |
+| 96 GiB | 11.26 / 11.19 s | 2.463 s | 1.475 s |
+
+Everything is inside 1%, and even releasing immediately costs only ~0.15 s on
+the allocation-heavy run. The 24 GiB value stays. This closes the GB10-shaped
+assumption; the knob remains for re-measuring.
+
 ## 2026-09-17 — SM120 KEEP: shared-memory Conv3d for the video VAE encoder (12.5 s → 2.4 s)
 
 Encoding one 512² anchor image ran 306 `h3_conv3d_f32_kernel` launches for

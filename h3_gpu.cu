@@ -445,7 +445,17 @@ h3_gpu *h3_gpu_create(const char *shader_source_path, char *error,
         cudaMemPool_t pool = NULL;
         if (cudaDeviceGetDefaultMemPool(&pool, gpu->device) == cudaSuccess &&
             pool) {
+            /* GB10 kept 24 GiB of freed blocks resident, chosen when the
+             * pool shared 128 GB with the host. H3_GPU_POOL_RELEASE_GIB
+             * overrides it so the value can be measured. */
             uint64_t threshold = (uint64_t)24 << 30;
+            const char *configured = getenv("H3_GPU_POOL_RELEASE_GIB");
+            if (configured && *configured) {
+                char *end = NULL;
+                double gib = strtod(configured, &end);
+                if (end && !*end && gib >= 0.0 && gib <= 4096.0)
+                    threshold = (uint64_t)(gib * (double)(1u << 30));
+            }
             cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold,
                                     &threshold);
             gpu->pool_alloc = 1;

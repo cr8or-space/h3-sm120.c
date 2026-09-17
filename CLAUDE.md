@@ -148,8 +148,7 @@ Key cross-file facts:
   Single-shot `-p` runs still load everything per process. Loader fan-out
   was re-measured on SM120 (2026-09-17) and is bound by page-cache copy
   speed, not by `H3_LOAD_STAGE_MIB` or `H3_LOAD_READ_THREADS`: leave it.
-- **GB10-shaped assumptions to revisit on SM120:** the 24 GiB memory-pool
-  release threshold in `h3_gpu_create`;
+- **GB10-shaped assumptions to revisit on SM120:** the
   MMA/GEMM tile widths that were chosen because wider variants (`tcgen05`,
   WGMMA, `ldmatrix.x4`) were closed on GB10. Re-probe those on SM120
   (`tools/h3_ldmatrix_map.cu` is the probe pattern) rather than inheriting the
@@ -171,8 +170,6 @@ Remaining items from the first SM120 baseline, best first. Measurements go in
    occupancy and barrier probes were all REJECT on 2026-09-17. The open idea
    is fewer K/V staging bytes per FLOP, e.g. several query tiles sharing one
    staged KV tile.
-3. **Memory-pool release threshold.** The 24 GiB value in `h3_gpu_create`
-   is still unmeasured on SM120.
 
 ## Generate presets and quality rules
 
