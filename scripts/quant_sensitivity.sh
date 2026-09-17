@@ -5,7 +5,8 @@
 # the resulting clips answer whether those formats are admissible at all.
 set -euo pipefail
 
-MODEL_ROOT="${H3_MODEL_ROOT:-/home/alex/HF-MODELS/MiniMax-H3}"
+. "$(dirname "$0")/model_root.sh"
+MODEL_ROOT="$(h3_model_root)"
 OUT_DIR="${1:-/tmp/h3_levels}"
 PROMPT="A red fox walks through fresh snow in a pine forest. Medium tracking shot, natural winter light, realistic fur, soft footsteps and wind."
 

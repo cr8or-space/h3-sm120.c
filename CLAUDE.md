@@ -17,19 +17,21 @@ NVMe, or GB10's instruction set, re-measure on SM120 instead of assuming.
 
 **Do not add personally identifying information to the repo:** no machine or
 host names, user names, home-directory paths, internal URLs or network details.
-Naming the GPU model and its configuration is fine. The inherited tree already
-has a leaked upstream home path (`/home/.../HF-MODELS/MiniMax-H3` fallbacks in
-`Makefile.linux`, `scripts/*.sh`, `tests/test_cuda_{dit_block,audio_vae}_smoke.c`);
-replace those with `$H3_MODEL_ROOT` rather than adding another hard-coded path.
+Naming the GPU model and its configuration is fine. Never hard-code a
+weights path; resolve it through `H3_MODEL_ROOT`.
 
 ## Weights
 
 The official BF16 checkpoint is already in the Hugging Face cache under
-`$HF_HOME`. Its snapshot directory contains `FL2VA/` and `Ref2VA/` and can be passed
-directly as the model root:
+`$HF_HOME`. Its snapshot directory contains `FL2VA/` and `Ref2VA/` and is the
+model root. `Makefile.linux` and `scripts/model_root.sh` (sourced by the other
+scripts) both default `H3_MODEL_ROOT` to the newest
+`$HF_HOME/hub/models--MiniMaxAI--MiniMax-H3/snapshots/*`, else `./MiniMax-H3`.
+The make default is exported to test recipes. When running `./h3` or a test
+binary by hand, set it yourself:
 
 ```bash
-export H3_MODEL_ROOT=$(ls -d "$HF_HOME"/hub/models--MiniMaxAI--MiniMax-H3/snapshots/* | head -1)
+export H3_MODEL_ROOT=$(ls -d "$HF_HOME"/hub/models--MiniMaxAI--MiniMax-H3/snapshots/* | tail -1)
 ```
 
 `h3_load_dir()` in `h3.c` requires `FL2VA/{transformer,text_encoder,video_vae/source,audio_vae,tokenizer}`;
@@ -49,9 +51,9 @@ make -f Makefile.linux -j$(nproc) h3
 ./h3 --info -d "$H3_MODEL_ROOT"
 ```
 
-**Arch pin:** `NVCCFLAGS` hard-codes `-gencode arch=compute_121,code=sm_121`
-(GB10). Before anything runs on SM120, change it to `compute_120,code=sm_120`.
-`NVCC_EXTRA` only appends flags, so it cannot override the pin. Toolchain:
+`CUDA_ARCH` (default `120`) sets `-gencode arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH)`.
+`CUDA_ARCH=121` rebuilds for GB10. After changing it, run `make -f Makefile.linux clean`,
+because objects don't depend on the flags. Toolchain:
 `/usr/local/cuda/bin/nvcc` (CUDA 13.x), gcc, `libicu-dev`, cuBLAS/cuBLASLt. At
 runtime `ffmpeg`/`ffprobe` must be on `PATH` (override with `H3_FFMPEG` /
 `H3_FFPROBE`). Media I/O is spawned, never linked, so without them the MP4
@@ -129,14 +131,16 @@ Key cross-file facts:
   `H3_DISABLE_INT8_*`, `H3_BF16_MLP`, `H3_SDPA_LDMATRIX=0`, `H3_SDPA_HALF`, …;
   `grep -n 'getenv("H3_' h3_dit.c h3_gpu.cu`). Keep an oracle for any new fused
   path so A/B against the unfused path stays possible.
-- **GB10-shaped assumptions to revisit on SM120:** the arch pin; loader
+- **GB10-shaped assumptions to revisit on SM120:** loader
   fan-out (`H3_LOAD_READ_THREADS`, `H3_LOAD_STAGE_MIB`, pinned `stage_host`
   buffers) tuned for Spark NVMe and UMA, where SM120 loads over PCIe from
   network storage; the 24 GiB memory-pool release threshold in `h3_gpu_create`;
   MMA/GEMM tile widths that were chosen because wider variants (`tcgen05`,
   WGMMA, `ldmatrix.x4`) were closed on GB10. Re-probe those on SM120
   (`tools/h3_ldmatrix_map.cu` is the probe pattern) rather than inheriting the
-  verdict. `--info` prints `h3-spark` and reports unified memory from the probe.
+  verdict. `--info` still prints `h3-spark`. Its "unified memory yes" is
+  CUDA's unified *addressing* flag, not shared physical memory: on SM120 the
+  96 GB is separate from host RAM.
 
 ## Generate presets and quality rules
 

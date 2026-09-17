@@ -26,13 +26,8 @@ int main(int argc, char **argv) {
     const char *model_root = argc > 1 ? argv[1] : getenv("H3_MODEL_ROOT");
     if (!model_root) model_root = "MiniMax-H3";
     if (!weights_available(model_root)) {
-        const char *fallback = "/home/alex/HF-MODELS/MiniMax-H3";
-        if (weights_available(fallback)) {
-            model_root = fallback;
-        } else {
-            puts("skip: video VAE weights not available");
-            return 0;
-        }
+        puts("skip: video VAE weights not available");
+        return 0;
     }
 
     /* Tiny latent: channels×T×H×W = 24×2×2×2 → 5 frames @ 32×32. */

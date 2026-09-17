@@ -231,7 +231,7 @@ Same machine (DGX Spark GB10), `--profile`, seed 42. Logs:
 
 ### Tests
 
-`H3_MODEL_ROOT=/home/alex/HF-MODELS/MiniMax-H3`. Tokenizer smoke skipped (no
+`H3_MODEL_ROOT` set to the official checkpoint. Tokenizer smoke skipped (no
 `MiniMax-H3/tokenizer` in the build cwd). `--ref-video` not included.
 
 | Target | Wall | Notes |
@@ -3600,7 +3600,7 @@ number. Commit at the time of the run was `6c95331` on `perf/dit-denoise-opt`.
 Command (`/tmp/h3_opt/run-long-15s.sh`):
 
 ```
-./h3 --profile -d /home/alex/HF-MODELS/MiniMax-H3 \
+./h3 --profile -d /path/to/MiniMax-H3 \
   -p "<15s cinematic prompt>" \
   --width 864 --height 480 --seconds 15 \
   --steps 20 --layers 45 --reuse 2 --seed 42 \

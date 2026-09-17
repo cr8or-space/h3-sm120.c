@@ -3,7 +3,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-MODEL="${H3_MODEL_ROOT:-/home/alex/HF-MODELS/MiniMax-H3}"
+. "$ROOT/scripts/model_root.sh"
+MODEL="$(h3_model_root)"
 OUTDIR="${PERF2_OUT:-/tmp/h3_perf2}"
 REF="${PERF2_REF:-$OUTDIR/ref-fox-fast.mp4}"
 mkdir -p "$OUTDIR"

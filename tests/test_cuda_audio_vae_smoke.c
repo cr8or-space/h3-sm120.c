@@ -30,13 +30,8 @@ int main(int argc, char **argv) {
     const char *model_root = argc > 1 ? argv[1] : getenv("H3_MODEL_ROOT");
     if (!model_root) model_root = "MiniMax-H3";
     if (!weights_available(model_root)) {
-        const char *fallback = "/home/alex/HF-MODELS/MiniMax-H3";
-        if (weights_available(fallback)) {
-            model_root = fallback;
-        } else {
-            puts("skip: audio VAE weights not available");
-            return 0;
-        }
+        puts("skip: audio VAE weights not available");
+        return 0;
     }
 
     float latent[LATENT_COUNT];

@@ -4,7 +4,8 @@
 # Env: H3_CONDITIONAL_SKIP_REF_VIDEO=1 to skip long --ref-video (72 frames)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-MODEL="${1:-${H3_MODEL_ROOT:-/home/alex/HF-MODELS/MiniMax-H3}}"
+. "$ROOT/scripts/model_root.sh"
+MODEL="${1:-$(h3_model_root)}"
 H3="${ROOT}/h3"
 ASSETS="${TMPDIR:-/tmp}/h3_func_assets"
 mkdir -p "$ASSETS"

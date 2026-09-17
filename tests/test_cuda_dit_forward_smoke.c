@@ -121,11 +121,6 @@ int main(int argc, char **argv) {
     int int8_mlp = strcmp(mode, "int8") == 0 || strcmp(mode, "int8-full") == 0;
     if (!model_root) model_root = "MiniMax-H3";
     if (!weights_available(model_root)) {
-        const char *fallback = "/home/alex/HF-MODELS/MiniMax-H3";
-        if (model_root != fallback && weights_available(fallback))
-            model_root = fallback;
-    }
-    if (!weights_available(model_root)) {
         puts("skip: MiniMax-H3 transformer weights not available");
         return 0;
     }
