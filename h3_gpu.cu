@@ -7517,6 +7517,98 @@ __global__ static void h3_conv3d_f32_kernel(const float *input,
     output[index] = acc;
 }
 
+/* Same Conv3d, with the weights staged in shared memory.
+ *
+ * The naive kernel gives each thread one output element, and consecutive
+ * threads differ in the output channel. Their input reads are therefore a warp
+ * broadcast, but their weight reads are 32 addresses one weight row apart, so
+ * each weight instruction costs a transaction per lane. Here a block covers
+ * H3_CONV3D_OC x H3_CONV3D_POS outputs and stages the block's weight slice
+ * coalesced, once per output-position tile.
+ *
+ * The reduction runs in the naive kernel's order (input channel, then kd, kh,
+ * kw) with the same `fmaf`, so the result is bit-identical. Keeping that means
+ * no tensor cores and no split reduction, both of which would reorder it. */
+enum { H3_CONV3D_OC = 32u, H3_CONV3D_POS = 8u,
+       H3_CONV3D_WEIGHT_FLOATS = 4096u };
+
+__global__ __launch_bounds__(H3_CONV3D_OC *H3_CONV3D_POS) static void
+h3_conv3d_f32_tiled_kernel(const float *__restrict__ input,
+                           const float *__restrict__ weight,
+                           const float *__restrict__ bias,
+                           float *__restrict__ output, h3_conv3d_args args,
+                           uint32_t channel_chunk) {
+    extern __shared__ float weight_tile[];
+    const uint32_t taps =
+        args.kernel_depth * args.kernel_height * args.kernel_width;
+    const uint32_t threads = H3_CONV3D_OC * H3_CONV3D_POS;
+    const uint32_t tid = threadIdx.y * H3_CONV3D_OC + threadIdx.x;
+    const uint32_t oc_base = blockIdx.x * H3_CONV3D_OC;
+    const uint32_t oc = oc_base + threadIdx.x;
+    size_t positions = (size_t)args.batch * args.output_depth *
+                       args.output_height * args.output_width;
+    size_t position = (size_t)blockIdx.y * H3_CONV3D_POS + threadIdx.y;
+    int live = oc < args.output_channels && position < positions;
+
+    uint32_t ox = 0, oy = 0, od = 0, batch = 0;
+    if (live) {
+        size_t rest = position;
+        ox = (uint32_t)(rest % args.output_width);
+        rest /= args.output_width;
+        oy = (uint32_t)(rest % args.output_height);
+        rest /= args.output_height;
+        od = (uint32_t)(rest % args.output_depth);
+        batch = (uint32_t)(rest / args.output_depth);
+    }
+    float acc = live && args.has_bias ? bias[oc] : 0.0f;
+
+    /* Uniform across the block, so every thread reaches both barriers. */
+    for (uint32_t base = 0; base < args.input_channels;
+         base += channel_chunk) {
+        uint32_t chunk = args.input_channels - base < channel_chunk
+                             ? args.input_channels - base
+                             : channel_chunk;
+        uint32_t staged = H3_CONV3D_OC * chunk * taps;
+        __syncthreads();
+        for (uint32_t index = tid; index < staged; index += threads) {
+            uint32_t local_oc = index / (chunk * taps);
+            uint32_t rest = index - local_oc * chunk * taps;
+            uint32_t source_oc = oc_base + local_oc;
+            weight_tile[index] =
+                source_oc < args.output_channels
+                    ? weight[((size_t)source_oc * args.input_channels + base) *
+                                 taps +
+                             rest]
+                    : 0.0f;
+        }
+        __syncthreads();
+        if (!live) continue;
+        const float *row = weight_tile + (size_t)threadIdx.x * chunk * taps;
+        for (uint32_t local = 0; local < chunk; local++) {
+            uint32_t ic = base + local;
+            uint32_t tap = 0;
+            for (uint32_t kd = 0; kd < args.kernel_depth; kd++) {
+                uint32_t id = od * args.stride_depth + kd;
+                for (uint32_t kh = 0; kh < args.kernel_height; kh++) {
+                    uint32_t ih = oy * args.stride_height + kh;
+                    size_t plane =
+                        (((size_t)batch * args.depth + id) * args.height + ih) *
+                        args.width;
+                    for (uint32_t kw = 0; kw < args.kernel_width; kw++) {
+                        uint32_t iw = ox * args.stride_width + kw;
+                        acc = fmaf(input[(plane + iw) * args.input_channels +
+                                         ic],
+                                   row[local * taps + tap], acc);
+                        tap++;
+                    }
+                }
+            }
+        }
+    }
+    if (live)
+        output[position * args.output_channels + oc] = acc;
+}
+
 int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
                       const h3_gpu_tensor *weight,
@@ -7547,19 +7639,46 @@ int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         weight->elements < weight_count ||
         (bias && bias->elements < output_channels))
         return h3_gpu_fail(gpu, "invalid Conv3d tensor shapes");
+    if (h3_env_on("H3_CONV3D_SHAPES"))
+        fprintf(stderr,
+                "h3 conv3d b=%u d=%u h=%u w=%u ic=%u oc=%u k=%ux%ux%u "
+                "s=%ux%ux%u out=%ux%ux%u\n",
+                batch, depth, height, width, input_channels, output_channels,
+                kernel_depth, kernel_height, kernel_width, stride_depth,
+                stride_height, stride_width, output_depth, output_height,
+                output_width);
     h3_gpu_op_begin(gpu, H3_GPU_OP_CONV);
     h3_conv3d_args args = {
         batch,         depth,          height,         width,
         output_depth,  output_height,  output_width,   input_channels,
         output_channels, kernel_depth, kernel_height,  kernel_width,
         stride_depth,  stride_height,  stride_width,   bias ? 1u : 0u};
-    unsigned threads = 256;
-    unsigned blocks =
-        (unsigned)((output_count + threads - 1) / threads);
-    h3_conv3d_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
-        (const float *)input->device, (const float *)weight->device,
-        bias ? (const float *)bias->device : NULL, (float *)output->device,
-        args);
+    uint32_t taps = kernel_depth * kernel_height * kernel_width;
+    uint32_t channel_chunk = H3_CONV3D_WEIGHT_FLOATS / (H3_CONV3D_OC * taps);
+    if (channel_chunk < 1u) channel_chunk = 1u;
+    if (channel_chunk > input_channels) channel_chunk = input_channels;
+    if (h3_env_on("H3_CONV3D_NAIVE")) {
+        unsigned threads = 256;
+        unsigned blocks = (unsigned)((output_count + threads - 1) / threads);
+        h3_conv3d_f32_kernel<<<blocks, threads, 0, gpu->stream>>>(
+            (const float *)input->device, (const float *)weight->device,
+            bias ? (const float *)bias->device : NULL,
+            (float *)output->device, args);
+    } else {
+        size_t positions =
+            (size_t)batch * output_depth * output_height * output_width;
+        dim3 threads(H3_CONV3D_OC, H3_CONV3D_POS, 1);
+        dim3 blocks((output_channels + H3_CONV3D_OC - 1u) / H3_CONV3D_OC,
+                    (unsigned)((positions + H3_CONV3D_POS - 1u) /
+                               H3_CONV3D_POS),
+                    1);
+        size_t shared =
+            (size_t)H3_CONV3D_OC * channel_chunk * taps * sizeof(float);
+        h3_conv3d_f32_tiled_kernel<<<blocks, threads, shared, gpu->stream>>>(
+            (const float *)input->device, (const float *)weight->device,
+            bias ? (const float *)bias->device : NULL,
+            (float *)output->device, args, channel_chunk);
+    }
     gpu->stats.mps_conv_dispatches++;
     int conv3d_ok = h3_cuda_check(gpu, cudaGetLastError(), "h3_conv3d_f32");
     h3_gpu_op_end(gpu);

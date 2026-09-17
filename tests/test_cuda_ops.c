@@ -667,6 +667,152 @@ static void check_concurrent_staged_reads(h3_gpu *gpu) {
  * F32 payloads survive the file round trip exactly (docs/PERF_BASELINE.md,
  * 2026-08-26). An offset past the first staging chunk keeps the multi-chunk
  * path in the test. */
+/* Conv3d has two kernels: the naive one and the shared-memory tiled default
+ * (H3_CONV3D_NAIVE=1 selects the naive one). The tiled kernel keeps the naive
+ * reduction order deliberately, so both must match a host reference that uses
+ * the same order exactly, not approximately. */
+static void conv3d_ref(const float *input, const float *weight,
+                       const float *bias, float *output, uint32_t batch,
+                       uint32_t depth, uint32_t height, uint32_t width,
+                       uint32_t input_channels, uint32_t output_channels,
+                       uint32_t k, uint32_t stride) {
+    uint32_t out_d = (depth - k) / stride + 1u;
+    uint32_t out_h = (height - k) / stride + 1u;
+    uint32_t out_w = (width - k) / stride + 1u;
+    for (uint32_t b = 0; b < batch; b++)
+        for (uint32_t od = 0; od < out_d; od++)
+            for (uint32_t oy = 0; oy < out_h; oy++)
+                for (uint32_t ox = 0; ox < out_w; ox++)
+                    for (uint32_t oc = 0; oc < output_channels; oc++) {
+                        float acc = bias ? bias[oc] : 0.0f;
+                        for (uint32_t ic = 0; ic < input_channels; ic++)
+                            for (uint32_t kd = 0; kd < k; kd++)
+                                for (uint32_t kh = 0; kh < k; kh++)
+                                    for (uint32_t kw = 0; kw < k; kw++) {
+                                        size_t in =
+                                            ((((size_t)b * depth +
+                                               od * stride + kd) *
+                                                  height +
+                                              oy * stride + kh) *
+                                                 width +
+                                             ox * stride + kw) *
+                                                input_channels +
+                                            ic;
+                                        size_t w =
+                                            ((((size_t)oc * input_channels +
+                                               ic) *
+                                                  k +
+                                              kd) *
+                                                 k +
+                                             kh) *
+                                                k +
+                                            kw;
+                                        acc = fmaf(input[in], weight[w], acc);
+                                    }
+                        size_t out = ((((size_t)b * out_d + od) * out_h + oy) *
+                                          out_w +
+                                      ox) *
+                                         output_channels +
+                                     oc;
+                        output[out] = acc;
+                    }
+}
+
+static void check_conv3d_f32(h3_gpu *gpu) {
+    /* Shapes chosen to exercise both kernels' edges: an output channel count
+     * that is not a multiple of the 32-wide tile, a position count that is not
+     * a multiple of the 8-deep tile, a stride, and a 1x1x1 kernel. */
+    struct {
+        const char *name;
+        uint32_t batch, depth, height, width, input_channels;
+        uint32_t output_channels, k, stride;
+        int bias;
+    } cases[] = {
+        {"3x3x3", 1, 3, 9, 9, 5, 37, 3, 1, 1},
+        {"3x3x3 stride 2", 1, 3, 11, 11, 6, 32, 3, 2, 0},
+        {"1x1x1", 1, 1, 5, 7, 40, 9, 1, 1, 1},
+        {"wide channels", 1, 3, 5, 5, 70, 8, 3, 1, 1},
+    };
+    for (size_t index = 0; index < sizeof(cases) / sizeof(*cases); index++) {
+        uint32_t k = cases[index].k, stride = cases[index].stride;
+        uint32_t out_d = (cases[index].depth - k) / stride + 1u;
+        uint32_t out_h = (cases[index].height - k) / stride + 1u;
+        uint32_t out_w = (cases[index].width - k) / stride + 1u;
+        size_t input_count = (size_t)cases[index].batch * cases[index].depth *
+                             cases[index].height * cases[index].width *
+                             cases[index].input_channels;
+        size_t weight_count = (size_t)cases[index].output_channels *
+                              cases[index].input_channels * k * k * k;
+        size_t output_count = (size_t)cases[index].batch * out_d * out_h *
+                              out_w * cases[index].output_channels;
+        float *input = malloc(input_count * sizeof(*input));
+        float *weight = malloc(weight_count * sizeof(*weight));
+        float *bias = malloc(cases[index].output_channels * sizeof(*bias));
+        float *reference = malloc(output_count * sizeof(*reference));
+        float *got = malloc(output_count * sizeof(*got));
+        if (!input || !weight || !bias || !reference || !got) {
+            fprintf(stderr, "FAIL: conv3d_f32 host alloc\n");
+            failures++;
+            free(input); free(weight); free(bias); free(reference); free(got);
+            return;
+        }
+        for (size_t i = 0; i < input_count; i++)
+            input[i] = sinf((float)i * 0.031f);
+        for (size_t i = 0; i < weight_count; i++)
+            weight[i] = cosf((float)i * 0.017f) * 0.25f;
+        for (uint32_t i = 0; i < cases[index].output_channels; i++)
+            bias[i] = 0.01f * (float)i;
+        conv3d_ref(input, weight, cases[index].bias ? bias : NULL, reference,
+                   cases[index].batch, cases[index].depth,
+                   cases[index].height, cases[index].width,
+                   cases[index].input_channels, cases[index].output_channels,
+                   k, stride);
+        h3_gpu_tensor *input_t =
+            h3_gpu_tensor_from_f32(gpu, input, input_count);
+        h3_gpu_tensor *weight_t =
+            h3_gpu_tensor_from_f32(gpu, weight, weight_count);
+        h3_gpu_tensor *bias_t = h3_gpu_tensor_from_f32(
+            gpu, bias, cases[index].output_channels);
+        h3_gpu_tensor *output_t = h3_gpu_tensor_new_f32(gpu, output_count);
+        check(input_t && weight_t && bias_t && output_t,
+              "conv3d_f32 tensor alloc");
+        for (int naive = 0; naive < 2 && input_t && weight_t && bias_t &&
+                            output_t; naive++) {
+            if (naive)
+                setenv("H3_CONV3D_NAIVE", "1", 1);
+            else
+                unsetenv("H3_CONV3D_NAIVE");
+            check(h3_gpu_conv3d_f32(gpu, output_t, input_t, weight_t,
+                                    cases[index].bias ? bias_t : NULL,
+                                    cases[index].batch, cases[index].depth,
+                                    cases[index].height, cases[index].width,
+                                    cases[index].input_channels,
+                                    cases[index].output_channels, k, k, k,
+                                    stride, stride, stride),
+                  "conv3d_f32");
+            check(h3_gpu_submit(gpu), "submit conv3d_f32");
+            check(h3_gpu_tensor_read_f32(output_t, got, output_count),
+                  "read conv3d_f32");
+            for (size_t i = 0; i < output_count; i++)
+                if (got[i] != reference[i]) {
+                    fprintf(stderr,
+                            "FAIL: conv3d_f32 %s (%s) mismatch at %zu "
+                            "got=%.9g expected=%.9g\n",
+                            cases[index].name, naive ? "naive" : "tiled", i,
+                            got[i], reference[i]);
+                    failures++;
+                    break;
+                }
+        }
+        unsetenv("H3_CONV3D_NAIVE");
+        h3_gpu_tensor_free(input_t);
+        h3_gpu_tensor_free(weight_t);
+        h3_gpu_tensor_free(bias_t);
+        h3_gpu_tensor_free(output_t);
+        free(input); free(weight); free(bias); free(reference); free(got);
+    }
+}
+
 static void check_int8_cache_round_trip(h3_gpu *gpu) {
     enum { WEIGHT_ELEMENTS = 3 << 20, SCALE_ELEMENTS = 512, PAD = 4096 };
     char path[] = "/tmp/h3_int8_cache_XXXXXX";
@@ -4086,6 +4232,7 @@ int main(void) {
     h3_gpu_tensor_free(gaq_quant);
     h3_gpu_tensor_free(gaq_scales);
 
+    check_conv3d_f32(gpu);
     check_concurrent_staged_reads(gpu);
     check_int8_cache_round_trip(gpu);
 

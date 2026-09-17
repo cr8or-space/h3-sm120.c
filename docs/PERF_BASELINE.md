@@ -7,6 +7,44 @@ numbers are in the snapshots below. The 2026-08-17 tables after them are the
 SM120 (RTX PRO 6000 Blackwell Max-Q) sections are labelled as such. Every
 other section in this file is GB10.
 
+## 2026-09-17 — SM120 KEEP: shared-memory Conv3d for the video VAE encoder (12.5 s → 2.8 s)
+
+Encoding one 512² anchor image ran 306 `h3_conv3d_f32_kernel` launches for
+12.85 s of GPU time — the whole cost of an anchored or referenced request, and
+about 1% of this card's F32 throughput.
+
+The shapes (`H3_CONV3D_SHAPES=1`) are all `3x3x3` or `1x1x1` over a depth of 3,
+channel-last, with reductions of `input_channels * 27`: `ic=oc=128` at 256²
+(36 launches), `ic=oc=256` at 128² (27), and so on up to `ic=oc=1024` at 16².
+
+The naive kernel gives one thread one output element, with the output channel
+as the fastest index. Input reads are therefore a warp broadcast, but the 32
+lanes' weight reads sit one weight row apart, so each weight instruction costs
+a transaction per lane. The new kernel gives a block 32 output channels × 8
+output positions and stages that weight slice in shared memory, read coalesced
+once per position tile. Chunk size is `4096 / (32 * taps)` input channels, so
+the tile is at most 16 KiB.
+
+The reduction keeps the naive kernel's order — input channel, then kd, kh, kw,
+same `fmaf` — so the result is **bit-identical**. That rules out tensor cores
+and any split reduction, both of which reorder it.
+
+| Anchored fox-s2 single shot | Video VAE encoder | e2e wall | md5 |
+|---|---:|---:|---|
+| `H3_CONV3D_NAIVE=1` | 12.49 s | 21.23 s | `4bde49a56333` |
+| **tiled (default)** | **2.82 s** | **11.73 s** | `4bde49a56333` |
+
+`ncu` on the largest shape after the change: 7.20 ms per launch, SM throughput
+63%, L1/TEX 46%, DRAM 0.97%, 9.09 of 12 active warps per scheduler and 2.63
+eligible. It is now instruction-bound rather than transaction-bound.
+
+`tests/test_cuda_ops.c` gains a Conv3d check: four shapes (including an output
+channel count off the 32-wide tile, a position count off the 8-deep tile, a
+stride 2 case and a `1x1x1` kernel), and both kernels must equal a host
+reference with the same reduction order exactly, not approximately.
+
+fox-s2 `146495086e36` is unchanged, and both encoder smokes pass.
+
 ## 2026-09-17 — SM120 KEEP: anchored session prompts reuse the visual conditioning (RTX PRO 6000 Blackwell Max-Q)
 
 A session with `--first-frame`/`--last-frame` or `--ref-*` re-encoded its
