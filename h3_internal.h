@@ -32,6 +32,12 @@ struct h3_ctx {
      * weights key matches can be rebound instead of reloaded. */
     char *dit_weights_key;
     struct h3_dit *dit;
+    /* The visual conditioning latents, which depend on the anchor or reference
+     * media but not on the prompt: keyed by the conditioning key minus the
+     * prompt, so a new prompt in a session does not re-encode them. */
+    char *media_key;
+    float *media_video_rows;
+    size_t media_video_elements;
     char *video_decoder_key;
     struct h3_video_vae_decoder *video_decoder;
     struct h3_text_encoder *text_encoder;

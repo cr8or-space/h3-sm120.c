@@ -7,6 +7,51 @@ numbers are in the snapshots below. The 2026-08-17 tables after them are the
 SM120 (RTX PRO 6000 Blackwell Max-Q) sections are labelled as such. Every
 other section in this file is GB10.
 
+## 2026-09-17 — SM120 KEEP: anchored session prompts reuse the visual conditioning (RTX PRO 6000 Blackwell Max-Q)
+
+A session with `--first-frame`/`--last-frame` or `--ref-*` re-encoded its
+conditioning media for every new prompt. The conditioning cache is keyed by the
+prompt, so a new prompt missed it and re-ran the whole media path.
+
+Measured per prompt (fox-s2 knobs, one 512² `--first-frame` anchor, three
+prompts piped to a session):
+
+| Step | Wall | Note |
+|---|---:|---|
+| video VAE encoder | 12.35 s | `conv` 12.17 s of GPU time; only 0.67 GiB staged, so this is compute, not loading |
+| Qwen vision encoder | 0.17–0.21 s | |
+| text encode (resident) | 0.38 s | |
+| DiT rebind | 0.16 s | |
+
+So the cost was the VAE encoder's convolutions, not a weight load as the
+earlier note assumed.
+
+The visual conditioning latents depend on the media and the render geometry,
+never on the prompt. The conditioning key is now built from a separate media
+key (the same fields minus the prompt), and the patchified latents are cached
+under it. A new prompt copies them and skips the encode; the decoded pixels are
+still re-encoded by the vision encoder, which costs 0.2 s. `!cache` reports the
+cached bytes, and the entry is dropped as soon as the media key changes.
+
+| Generation (session) | Before | **After** | md5 |
+|---|---:|---:|---|
+| 1 anchored (cold) | 21.46 s | 21.36 s | `c53e46e2c76e` |
+| 2 new prompt | 14.49 s | **2.29 s** | `4bde49a56333` |
+| 3 first prompt again | 14.48 s | **2.22 s** | `c53e46e2c76e` |
+
+- All three outputs are unchanged, byte for byte.
+- A Ref2VA session (`--ref-image`) behaves the same: 22.66 s then **2.55 s**,
+  and the second prompt's file is identical to a single-shot run of that
+  prompt (`a3d4ee656453`). The FL2VA case matches its single-shot run too
+  (`4bde49a56333`).
+- fox-s2 `146495086e36` unchanged, `make test` passes with no skips, and
+  `test-conditional` passes.
+
+Still re-encoded per prompt: reference *audio* (`h3_audio_vae_encode`), which
+this preset does not exercise. The first prompt still pays the 12.2 s encode,
+which is now the largest single cost in an anchored request: 306 conv
+dispatches for one 512² image.
+
 ## 2026-09-17 — SM120 video VAE decode: host work off the GPU's thread (RTX PRO 6000 Blackwell Max-Q)
 
 Tooling added for this work:

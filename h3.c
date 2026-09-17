@@ -120,9 +120,38 @@ static void h3_conditioning_cache_clear(h3_ctx *ctx) {
     ctx->conditioning_present = 0;
 }
 
+static void h3_media_cache_clear(h3_ctx *ctx) {
+    if (!ctx) return;
+    free(ctx->media_key);
+    free(ctx->media_video_rows);
+    ctx->media_key = NULL;
+    ctx->media_video_rows = NULL;
+    ctx->media_video_elements = 0;
+}
+
+/* Keeps the encoded visual conditioning for the next prompt. Takes a copy,
+ * because the caller keeps using its own rows. */
+static void h3_media_cache_store(h3_ctx *ctx, const char *key,
+                                 const float *rows, size_t elements) {
+    if (!ctx || !ctx->cache_enabled || !key || !rows || !elements) return;
+    char *key_copy = strdup(key);
+    float *rows_copy = malloc(elements * sizeof(*rows_copy));
+    if (!key_copy || !rows_copy) {
+        free(key_copy);
+        free(rows_copy);
+        return; /* an optimization only; the next prompt just re-encodes */
+    }
+    memcpy(rows_copy, rows, elements * sizeof(*rows_copy));
+    h3_media_cache_clear(ctx);
+    ctx->media_key = key_copy;
+    ctx->media_video_rows = rows_copy;
+    ctx->media_video_elements = elements;
+}
+
 void h3_cache_clear(h3_ctx *ctx) {
     if (!ctx) return;
     h3_conditioning_cache_clear(ctx);
+    h3_media_cache_clear(ctx);
     h3_dit_free(ctx->dit);
     ctx->dit = NULL;
     free(ctx->dit_key);
@@ -164,6 +193,8 @@ void h3_cache_get_info(const h3_ctx *ctx, h3_cache_info *info) {
             ctx->conditioning_audio_elements *
                 sizeof(*ctx->conditioning_audio_rows);
     }
+    info->media_latent_bytes =
+        ctx->media_video_elements * sizeof(*ctx->media_video_rows);
     info->prepared_dit = ctx->dit != NULL;
     info->video_decoder = ctx->video_decoder != NULL;
     info->text_encoder = ctx->text_encoder != NULL;
@@ -222,15 +253,15 @@ static int h3_key_file(h3_key *key, const char *role, const char *path) {
 #endif
 }
 
-static char *h3_conditioning_key(const char *prompt, const h3_params *params,
-                                 int render_width, int render_height,
-                                 int ref2va) {
+/* The conditioning key's media half: everything the visual conditioning
+ * depends on, and nothing the prompt does. NULL when the request has no
+ * conditioning media. */
+static char *h3_media_key(const h3_params *params, int render_width,
+                          int render_height, int ref2va) {
+    if (!ref2va && !params->first_frame && !params->last_frame) return NULL;
     h3_key key = {0};
-    if (!h3_key_append(&key, "mode=%d|prompt=%zu:%s", ref2va,
-                       strlen(prompt), prompt)) goto failed;
-    if (!ref2va && !params->first_frame && !params->last_frame) return key.text;
-    if (!h3_key_append(&key, "|render=%dx%d|frames=%d|image-size=%d",
-                       render_width, render_height, params->frames,
+    if (!h3_key_append(&key, "mode=%d|render=%dx%d|frames=%d|image-size=%d",
+                       ref2va, render_width, render_height, params->frames,
                        params->reference_image_size) ||
         !h3_key_file(&key, "first", params->first_frame) ||
         !h3_key_file(&key, "last", params->last_frame)) goto failed;
@@ -241,6 +272,19 @@ static char *h3_conditioning_key(const char *prompt, const h3_params *params,
             !h3_key_file(&key, "media", reference->path) ||
             !h3_key_file(&key, "audio", reference->audio_path)) goto failed;
     }
+    return key.text;
+failed:
+    free(key.text);
+    return NULL;
+}
+
+static char *h3_conditioning_key(const char *prompt, int ref2va,
+                                 const char *media_key) {
+    h3_key key = {0};
+    if (!h3_key_append(&key, "mode=%d|prompt=%zu:%s", ref2va,
+                       strlen(prompt), prompt)) goto failed;
+    if (!media_key) return key.text;
+    if (!h3_key_append(&key, "|%s", media_key)) goto failed;
     return key.text;
 failed:
     free(key.text);
@@ -1093,6 +1137,7 @@ static h3_result *h3_generate_once(h3_ctx *ctx, const char *prompt,
     char *prepared_key = NULL;
     char *dit_weights_key = NULL;
     char *decoder_key = NULL;
+    char *media_key = NULL;
     int conditioning_hit = 0;
     int conditioned = 0;
     int dit_is_cached = 0;
@@ -1112,12 +1157,15 @@ static h3_result *h3_generate_once(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "out of memory resolving generation model paths");
         goto cleanup;
     }
-    conditioning_key = h3_conditioning_key(
-        prompt, params, render_width, render_height, ref2va);
+    media_key = h3_media_key(params, render_width, render_height, ref2va);
+    conditioning_key = h3_conditioning_key(prompt, ref2va, media_key);
     if (!conditioning_key) {
         h3_set_error(ctx, "out of memory constructing conditioning cache key");
         goto cleanup;
     }
+    if (ctx->cache_enabled && ctx->media_key &&
+        (!media_key || strcmp(ctx->media_key, media_key)))
+        h3_media_cache_clear(ctx);
     prepared_key = h3_prepared_key(
         conditioning_key, params, render_width, render_height);
     h3_key weights_base = {0};
@@ -1478,8 +1526,18 @@ static h3_result *h3_generate_once(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "out of memory allocating visual condition rows");
             goto cleanup;
         }
+        int media_hit = ctx->cache_enabled && media_key && ctx->media_key &&
+            !strcmp(ctx->media_key, media_key) &&
+            ctx->media_video_elements == condition_video_elements;
+        if (media_hit) {
+            /* The decoded pixels are still needed by the vision encoder
+             * below, which costs 0.2 s; only the VAE encode is skipped. */
+            memcpy(condition_video_rows, ctx->media_video_rows,
+                   condition_video_elements * sizeof(*condition_video_rows));
+            fprintf(stderr, "h3: visual conditioning cache hit\n");
+        }
         size_t condition_offset = 0;
-        for (size_t image = 0; image < visual_count; image++) {
+        for (size_t image = 0; image < visual_count && !media_hit; image++) {
             int image_latent_w, image_latent_h;
             h3_latent_canvas(condition_widths[image], condition_heights[image],
                              &image_latent_w, &image_latent_h);
@@ -1521,10 +1579,13 @@ static h3_result *h3_generate_once(h3_ctx *ctx, const char *prompt,
             condition_offset += row_elements;
             if (progress.cancelled) goto cleanup;
         }
-        if (condition_offset != condition_video_elements) {
+        if (!media_hit && condition_offset != condition_video_elements) {
             h3_set_error(ctx, "visual condition packing size mismatch");
             goto cleanup;
         }
+        if (!media_hit)
+            h3_media_cache_store(ctx, media_key, condition_video_rows,
+                                 condition_video_elements);
         size_t vision_cursor = 0;
         for (size_t image = 0; image < visual_count; image++) {
             size_t reference_index = visual_reference_indices[image];
@@ -1945,6 +2006,7 @@ static h3_result *h3_generate_once(h3_ctx *ctx, const char *prompt,
 cleanup:
     h3_prefetch_join(vae_prefetch, vae_prefetch_started);
     free(conditioning_key);
+    free(media_key);
     free(prepared_key);
     free(dit_weights_key);
     free(decoder_key);

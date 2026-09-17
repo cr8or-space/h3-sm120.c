@@ -142,7 +142,9 @@ Key cross-file facts:
 - **Sessions keep models on the card.** Without `-p`, `./h3` is a REPL that
   also reads prompts piped on stdin. It holds the Qwen weights resident
   (`h3_text_encoder_load`; `H3_TEXT_RESIDENT=0|1`), rebinds the retained DiT
-  to each new prompt (`h3_dit_rebind`), and keeps the video decoder.
+  to each new prompt (`h3_dit_rebind`), keeps the video decoder, and reuses the
+  visual conditioning latents of `--first-frame`/`--last-frame`/`--ref-*` media
+  across prompts (a media-only cache key; reference audio is still re-encoded).
   Single-shot `-p` runs still load everything per process. Loader fan-out
   was re-measured on SM120 (2026-09-17) and is bound by page-cache copy
   speed, not by `H3_LOAD_STAGE_MIB` or `H3_LOAD_READ_THREADS`: leave it.
@@ -160,9 +162,10 @@ Key cross-file facts:
 Remaining items from the first SM120 baseline, best first. Measurements go in
 `docs/PERF_BASELINE.md`. When an item is finished, delete it from this list.
 
-1. **Anchored session prompts still reload.** With `--first`/`--last` or
-   references, each new prompt re-runs the vision encoder and VAE encoder
-   loads (fox-s2 knobs: 14.8 s per new prompt, against ~3 s for plain T2VA).
+1. **Video VAE encoder convolutions.** An anchored or referenced request
+   spends 12.2 s of GPU `conv` time encoding one 512² image (306 dispatches).
+   A session only pays it on the first prompt now, but every single-shot run
+   pays it. Not yet profiled per kernel.
 2. **Long-N SDPA needs a new kernel shape, not a retune.** Tile, warp,
    occupancy and barrier probes were all REJECT on 2026-09-17. The open idea
    is fewer K/V staging bytes per FLOP, e.g. several query tiles sharing one

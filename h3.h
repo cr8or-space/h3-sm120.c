@@ -23,6 +23,7 @@ typedef struct h3_result h3_result;
 typedef struct {
     size_t embedding_entries;
     size_t embedding_bytes;
+    size_t media_latent_bytes;
     int prepared_dit;
     int video_decoder;
     int text_encoder;

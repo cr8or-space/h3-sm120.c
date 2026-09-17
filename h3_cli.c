@@ -701,10 +701,11 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         } else {
             h3_cache_info info;
             h3_cache_get_info(state->ctx, &info);
-            printf("Cache: embeddings %zu (%.1f MiB), text encoder %s, "
-                   "DiT %s, video VAE %s\n",
+            printf("Cache: embeddings %zu (%.1f MiB), media latents %.1f MiB, "
+                   "text encoder %s, DiT %s, video VAE %s\n",
                    info.embedding_entries,
                    (double)info.embedding_bytes / (1024.0 * 1024.0),
+                   (double)info.media_latent_bytes / (1024.0 * 1024.0),
                    info.text_encoder ? "resident" : "empty",
                    info.prepared_dit ? "resident" : "empty",
                    info.video_decoder ? "resident" : "empty");

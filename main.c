@@ -35,7 +35,7 @@ static void usage(const char *program) {
         "                         off by default. Pays in quality (fox-fast\n"
         "                         ~17.8 dB PSNR / 0.72 SSIM vs off)\n"
         "      --sol-attn         Sparse SDPA for long T2VA; off by default.\n"
-        "                         15 s cinematic about −35% e2e, ~19.2 dB vs\n"
+        "                         15 s cinematic about −35%% e2e, ~19.2 dB vs\n"
         "                         the quality path. docs/SOL_ATTN.md\n"
         "      --ssd-streaming    Stream original BF16 DiT layers from SSD\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
