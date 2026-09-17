@@ -7526,10 +7526,14 @@ __global__ static void h3_conv3d_f32_kernel(const float *input,
  * H3_CONV3D_OC x H3_CONV3D_POS outputs and stages the block's weight slice
  * coalesced, once per output-position tile.
  *
+ * Each thread carries H3_CONV3D_PER output positions, which share the staged
+ * weight: that halves the loads per multiply in the inner loop, where the
+ * kernel is instruction-bound.
+ *
  * The reduction runs in the naive kernel's order (input channel, then kd, kh,
  * kw) with the same `fmaf`, so the result is bit-identical. Keeping that means
  * no tensor cores and no split reduction, both of which would reorder it. */
-enum { H3_CONV3D_OC = 32u, H3_CONV3D_POS = 8u,
+enum { H3_CONV3D_OC = 32u, H3_CONV3D_POS = 8u, H3_CONV3D_PER = 4u,
        H3_CONV3D_WEIGHT_FLOATS = 4096u };
 
 __global__ __launch_bounds__(H3_CONV3D_OC *H3_CONV3D_POS) static void
@@ -7547,20 +7551,33 @@ h3_conv3d_f32_tiled_kernel(const float *__restrict__ input,
     const uint32_t oc = oc_base + threadIdx.x;
     size_t positions = (size_t)args.batch * args.output_depth *
                        args.output_height * args.output_width;
-    size_t position = (size_t)blockIdx.y * H3_CONV3D_POS + threadIdx.y;
-    int live = oc < args.output_channels && position < positions;
+    size_t first_position = ((size_t)blockIdx.y * H3_CONV3D_POS + threadIdx.y) *
+                            H3_CONV3D_PER;
+    int channel_live = oc < args.output_channels;
 
-    uint32_t ox = 0, oy = 0, od = 0, batch = 0;
-    if (live) {
+    uint32_t ox[H3_CONV3D_PER], oy[H3_CONV3D_PER];
+    size_t plane_base[H3_CONV3D_PER];
+    int live[H3_CONV3D_PER];
+    float acc[H3_CONV3D_PER];
+    for (uint32_t slot = 0; slot < H3_CONV3D_PER; slot++) {
+        size_t position = first_position + slot;
+        live[slot] = channel_live && position < positions;
+        acc[slot] = live[slot] && args.has_bias ? bias[oc] : 0.0f;
+        ox[slot] = 0;
+        oy[slot] = 0;
+        plane_base[slot] = 0;
+        if (!live[slot]) continue;
         size_t rest = position;
-        ox = (uint32_t)(rest % args.output_width);
+        ox[slot] = (uint32_t)(rest % args.output_width);
         rest /= args.output_width;
-        oy = (uint32_t)(rest % args.output_height);
+        oy[slot] = (uint32_t)(rest % args.output_height);
         rest /= args.output_height;
-        od = (uint32_t)(rest % args.output_depth);
-        batch = (uint32_t)(rest / args.output_depth);
+        uint32_t od = (uint32_t)(rest % args.output_depth);
+        uint32_t batch = (uint32_t)(rest / args.output_depth);
+        plane_base[slot] =
+            ((size_t)batch * args.depth + od * args.stride_depth) *
+            args.height;
     }
-    float acc = live && args.has_bias ? bias[oc] : 0.0f;
 
     /* Uniform across the block, so every thread reaches both barriers. */
     for (uint32_t base = 0; base < args.input_channels;
@@ -7582,31 +7599,42 @@ h3_conv3d_f32_tiled_kernel(const float *__restrict__ input,
                     : 0.0f;
         }
         __syncthreads();
-        if (!live) continue;
+        if (!channel_live) continue;
         const float *row = weight_tile + (size_t)threadIdx.x * chunk * taps;
         for (uint32_t local = 0; local < chunk; local++) {
             uint32_t ic = base + local;
             uint32_t tap = 0;
             for (uint32_t kd = 0; kd < args.kernel_depth; kd++) {
-                uint32_t id = od * args.stride_depth + kd;
                 for (uint32_t kh = 0; kh < args.kernel_height; kh++) {
-                    uint32_t ih = oy * args.stride_height + kh;
-                    size_t plane =
-                        (((size_t)batch * args.depth + id) * args.height + ih) *
-                        args.width;
-                    for (uint32_t kw = 0; kw < args.kernel_width; kw++) {
-                        uint32_t iw = ox * args.stride_width + kw;
-                        acc = fmaf(input[(plane + iw) * args.input_channels +
-                                         ic],
-                                   row[local * taps + tap], acc);
-                        tap++;
+                    for (uint32_t kw = 0; kw < args.kernel_width; kw++,
+                                  tap++) {
+                        float w = row[local * taps + tap];
+                        for (uint32_t slot = 0; slot < H3_CONV3D_PER; slot++) {
+                            if (!live[slot]) continue;
+                            size_t plane =
+                                (plane_base[slot] +
+                                 oy[slot] * args.stride_height + kh) *
+                                    args.width +
+                                ox[slot] * args.stride_width + kw;
+                            acc[slot] = fmaf(
+                                input[plane * args.input_channels + ic], w,
+                                acc[slot]);
+                        }
                     }
                 }
+                /* kd advances the input plane by one row block. */
+                plane_base[0] += args.height;
+                for (uint32_t slot = 1; slot < H3_CONV3D_PER; slot++)
+                    plane_base[slot] += args.height;
             }
+            for (uint32_t slot = 0; slot < H3_CONV3D_PER; slot++)
+                plane_base[slot] -= (size_t)args.kernel_depth * args.height;
         }
     }
-    if (live)
-        output[position * args.output_channels + oc] = acc;
+    for (uint32_t slot = 0; slot < H3_CONV3D_PER; slot++)
+        if (live[slot])
+            output[(first_position + slot) * args.output_channels + oc] =
+                acc[slot];
 }
 
 int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -7668,8 +7696,10 @@ int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         size_t positions =
             (size_t)batch * output_depth * output_height * output_width;
         dim3 threads(H3_CONV3D_OC, H3_CONV3D_POS, 1);
+        size_t position_tiles =
+            (positions + H3_CONV3D_PER - 1u) / H3_CONV3D_PER;
         dim3 blocks((output_channels + H3_CONV3D_OC - 1u) / H3_CONV3D_OC,
-                    (unsigned)((positions + H3_CONV3D_POS - 1u) /
+                    (unsigned)((position_tiles + H3_CONV3D_POS - 1u) /
                                H3_CONV3D_POS),
                     1);
         size_t shared =

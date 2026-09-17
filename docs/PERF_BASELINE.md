@@ -7,7 +7,7 @@ numbers are in the snapshots below. The 2026-08-17 tables after them are the
 SM120 (RTX PRO 6000 Blackwell Max-Q) sections are labelled as such. Every
 other section in this file is GB10.
 
-## 2026-09-17 — SM120 KEEP: shared-memory Conv3d for the video VAE encoder (12.5 s → 2.8 s)
+## 2026-09-17 — SM120 KEEP: shared-memory Conv3d for the video VAE encoder (12.5 s → 2.4 s)
 
 Encoding one 512² anchor image ran 306 `h3_conv3d_f32_kernel` launches for
 12.85 s of GPU time — the whole cost of an anchored or referenced request, and
@@ -31,12 +31,25 @@ and any split reduction, both of which reorder it.
 
 | Anchored fox-s2 single shot | Video VAE encoder | e2e wall | md5 |
 |---|---:|---:|---|
-| `H3_CONV3D_NAIVE=1` | 12.49 s | 21.23 s | `4bde49a56333` |
-| **tiled (default)** | **2.82 s** | **11.73 s** | `4bde49a56333` |
+| `H3_CONV3D_NAIVE=1` | 12.49–12.78 s | 21.23 s | `4bde49a56333` |
+| **tiled (default)** | **2.39 s** | **11.7 s** | `4bde49a56333` |
 
-`ncu` on the largest shape after the change: 7.20 ms per launch, SM throughput
-63%, L1/TEX 46%, DRAM 0.97%, 9.09 of 12 active warps per scheduler and 2.63
-eligible. It is now instruction-bound rather than transaction-bound.
+`ncu` on the largest shape after the staging change: 7.20 ms per launch, SM
+throughput 63%, L1/TEX 46%, DRAM 0.97%, 9.09 of 12 active warps per scheduler
+and 2.63 eligible — instruction-bound rather than transaction-bound. So each
+thread also carries several output positions, which share the staged weight and
+halve the loads per multiply:
+
+| Positions per thread | Video VAE encoder |
+|---:|---:|
+| 1 | 2.82 s |
+| 2 | 2.54 s |
+| **4 (shipping)** | **2.39 s** |
+| 8 | 4.03 s (register pressure) |
+
+REJECT on the way: indexing the staged slice channel-last with a padded row
+stride, to remove a 4-way bank conflict on the tile reads, measured 2.80/2.82 s
+against 2.82 s. The conflict is not what the kernel waits on.
 
 `tests/test_cuda_ops.c` gains a Conv3d check: four shapes (including an output
 channel count off the 32-wide tile, a position count off the 8-deep tile, a

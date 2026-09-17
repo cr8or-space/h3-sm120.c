@@ -162,12 +162,11 @@ Key cross-file facts:
 Remaining items from the first SM120 baseline, best first. Measurements go in
 `docs/PERF_BASELINE.md`. When an item is finished, delete it from this list.
 
-1. **Video VAE encoder convolutions, second pass.** The shared-memory Conv3d
-   took one 512² image from 12.5 s to 2.8 s on 2026-09-17 and is now
-   instruction-bound (SM 63%, DRAM 1%). The open idea is register blocking:
-   each thread computing 2 positions × 2 output channels halves the loads per
-   fma. `H3_CONV3D_NAIVE=1` is the oracle, and the order must stay
-   bit-identical.
+1. **Video VAE encoder convolutions.** The shared-memory Conv3d took one 512²
+   image from 12.5 s to 2.4 s on 2026-09-17, and it is instruction-bound
+   (SM 63%, DRAM 1%). Bank-conflict-free staging was a REJECT. Anything
+   further has to keep the reduction order: `H3_CONV3D_NAIVE=1` is the oracle,
+   `H3_CONV3D_SHAPES=1` logs the shapes.
 2. **Long-N SDPA needs a new kernel shape, not a retune.** Tile, warp,
    occupancy and barrier probes were all REJECT on 2026-09-17. The open idea
    is fewer K/V staging bytes per FLOP, e.g. several query tiles sharing one
