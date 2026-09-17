@@ -72,10 +72,85 @@ static size_t element_bytes(cudaDataType type) {
     }
 }
 
-static void *device_fill(size_t bytes) {
+/* Operands are random by default. Constant bytes make INT8 GEMM ~1.4x faster
+ * than it is on real activations on SM120 (see PERF_BASELINE 2026-09-17), so a
+ * constant fill flatters exactly the path under comparison. --constant keeps
+ * the old 0x11 fill for reproducing earlier tables. */
+static int constant_fill = 0;
+
+typedef enum {
+    FILL_OPERAND, /* data matrix of the given element type */
+    FILL_OUTPUT,  /* written by the GEMM; contents do not matter */
+    FILL_F32_SCALE,
+    FILL_UE4M3_SCALE,
+    FILL_UE8M0_SCALE
+} fill_kind;
+
+static uint64_t fill_state = 0x9e3779b97f4a7c15ull;
+
+static uint32_t fill_next(void) {
+    fill_state ^= fill_state << 13;
+    fill_state ^= fill_state >> 7;
+    fill_state ^= fill_state << 17;
+    return (uint32_t)(fill_state >> 32);
+}
+
+static void *device_fill(size_t bytes, fill_kind kind, cudaDataType type) {
     void *memory = NULL;
     CHECK(cudaMalloc(&memory, bytes ? bytes : 1));
-    CHECK(cudaMemset(memory, 0x11, bytes));
+    if (constant_fill || kind == FILL_OUTPUT) {
+        CHECK(cudaMemset(memory, 0x11, bytes));
+        return memory;
+    }
+    unsigned char *host = (unsigned char *)malloc(bytes ? bytes : 1);
+    size_t index = 0;
+    switch (kind) {
+        case FILL_F32_SCALE:
+            for (; index + 4 <= bytes; index += 4) {
+                float value = 1e-3f * (1.0f + (float)(fill_next() % 1000) / 250.0f);
+                memcpy(host + index, &value, 4);
+            }
+            break;
+        case FILL_UE4M3_SCALE:
+            /* 0x30..0x4f: finite UE4M3 values around 1. */
+            for (; index < bytes; index++)
+                host[index] = (unsigned char)(0x30 + fill_next() % 32);
+            break;
+        case FILL_UE8M0_SCALE:
+            for (; index < bytes; index++)
+                host[index] = (unsigned char)(124 + fill_next() % 7);
+            break;
+        default:
+            if (type == CUDA_R_16BF) {
+                /* Finite normal values in roughly [2^-4, 2^4). */
+                for (; index + 2 <= bytes; index += 2) {
+                    uint32_t r = fill_next();
+                    uint16_t bits = (uint16_t)(((r >> 31) << 15) |
+                                               ((123u + r % 8u) << 7) |
+                                               ((r >> 8) & 0x7fu));
+                    memcpy(host + index, &bits, 2);
+                }
+            } else if (type == CUDA_R_8F_E4M3) {
+                /* Every E4M3 byte except the two NaN encodings. */
+                for (; index < bytes; index++) {
+                    unsigned char byte;
+                    do byte = (unsigned char)fill_next();
+                    while ((byte & 0x7f) == 0x7f);
+                    host[index] = byte;
+                }
+            } else if (type == CUDA_R_8I) {
+                for (; index < bytes; index++)
+                    host[index] = (unsigned char)((int)(fill_next() % 255) - 127);
+            } else {
+                /* Packed E2M1 nibbles: every code is a finite value. */
+                for (; index < bytes; index++)
+                    host[index] = (unsigned char)fill_next();
+            }
+            break;
+    }
+    for (; index < bytes; index++) host[index] = 0;
+    CHECK(cudaMemcpy(memory, host, bytes, cudaMemcpyHostToDevice));
+    free(host);
     return memory;
 }
 
@@ -94,9 +169,9 @@ static double bench(cublasLtHandle_t lt, const gemm_shape *shape,
         b_bytes = (size_t)k * n * element_bytes(precision->input);
     }
     size_t d_bytes = (size_t)m * n * element_bytes(precision->output);
-    void *a = device_fill(a_bytes);
-    void *b = device_fill(b_bytes);
-    void *d = device_fill(d_bytes);
+    void *a = device_fill(a_bytes, FILL_OPERAND, precision->input);
+    void *b = device_fill(b_bytes, FILL_OPERAND, precision->input);
+    void *d = device_fill(d_bytes, FILL_OUTPUT, precision->output);
     /* Block scaling wants one UE4M3 per 16 elements of K; outer-vector scaling
      * wants one FP32 per output row and per token. */
     size_t scale_group = precision->vec32_scaled ? 32 : 16;
@@ -110,14 +185,25 @@ static double bench(cublasLtHandle_t lt, const gemm_shape *shape,
             : (size_t)(((size_t)k + scale_group - 1) / scale_group) * n;
     int scaled = precision->block_scaled || precision->outer_vector_scaled ||
                  precision->vec32_scaled;
-    void *a_scale = scaled ? device_fill(a_scale_bytes) : NULL;
-    void *b_scale = scaled ? device_fill(b_scale_bytes) : NULL;
-    void *epilogue_out =
-        precision->apply_pass ? device_fill((size_t)m * n * 2) : NULL;
-    void *channel_scale =
-        precision->apply_pass ? device_fill((size_t)m * sizeof(float)) : NULL;
-    void *token_scale =
-        precision->apply_pass ? device_fill((size_t)n * sizeof(float)) : NULL;
+    fill_kind scale_kind = precision->outer_vector_scaled ? FILL_F32_SCALE
+                           : precision->vec32_scaled      ? FILL_UE8M0_SCALE
+                                                          : FILL_UE4M3_SCALE;
+    void *a_scale =
+        scaled ? device_fill(a_scale_bytes, scale_kind, CUDA_R_32F) : NULL;
+    void *b_scale =
+        scaled ? device_fill(b_scale_bytes, scale_kind, CUDA_R_32F) : NULL;
+    void *epilogue_out = precision->apply_pass
+                             ? device_fill((size_t)m * n * 2, FILL_OUTPUT,
+                                           CUDA_R_16BF)
+                             : NULL;
+    void *channel_scale = precision->apply_pass
+                              ? device_fill((size_t)m * sizeof(float),
+                                            FILL_F32_SCALE, CUDA_R_32F)
+                              : NULL;
+    void *token_scale = precision->apply_pass
+                            ? device_fill((size_t)n * sizeof(float),
+                                          FILL_F32_SCALE, CUDA_R_32F)
+                            : NULL;
 
     cublasLtMatmulDesc_t operation = NULL;
     cublasLtMatrixLayout_t layout_a = NULL, layout_b = NULL, layout_d = NULL;
@@ -245,11 +331,20 @@ done:
     return tflops;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    for (int arg = 1; arg < argc; arg++) {
+        if (!strcmp(argv[arg], "--constant")) {
+            constant_fill = 1;
+        } else {
+            fprintf(stderr, "usage: %s [--constant]\n", argv[0]);
+            return 2;
+        }
+    }
     cudaDeviceProp properties;
     CHECK(cudaGetDeviceProperties(&properties, 0));
-    printf("device %s sm_%d%d\n", properties.name, properties.major,
-           properties.minor);
+    printf("device %s sm_%d%d, %s operands\n", properties.name,
+           properties.major, properties.minor,
+           constant_fill ? "constant 0x11" : "random");
 
     cublasLtHandle_t lt = NULL;
     if (cublasLtCreate(&lt) != CUBLAS_STATUS_SUCCESS) {
@@ -264,10 +359,10 @@ int main(void) {
      * m is the output width and n is the token count, so the token count never
      * lands on a leading dimension. */
     const gemm_shape shapes[] = {
-        {"qkv      out=21504 tokens=1870 k=5376 ", 21504, 1870, 5376},
-        {"attn-out out=5376  tokens=1870 k=7168 ", 5376, 1870, 7168},
-        {"fc1      out=28672 tokens=1870 k=5376 ", 28672, 1870, 5376},
-        {"fc2      out=5376  tokens=1870 k=14336", 5376, 1870, 14336},
+        {"qkv      out=21504 tokens=1894 k=5376 ", 21504, 1894, 5376},
+        {"attn-out out=5376  tokens=1894 k=7168 ", 5376, 1894, 7168},
+        {"fc1      out=28672 tokens=1894 k=5376 ", 28672, 1894, 5376},
+        {"fc2      out=5376  tokens=1894 k=14336", 5376, 1894, 14336},
     };
     const gemm_precision precisions[] = {
         {"bf16", CUDA_R_16BF, CUDA_R_16BF, CUBLAS_COMPUTE_32F, CUDA_R_32F, 0, 0,

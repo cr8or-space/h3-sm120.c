@@ -7,6 +7,122 @@ numbers are in the snapshots below. The 2026-08-17 tables after them are the
 SM120 (RTX PRO 6000 Blackwell Max-Q) sections are labelled as such. Every
 other section in this file is GB10.
 
+## 2026-09-17 — SM120 INT8 GEMM options: nothing to take (RTX PRO 6000 Blackwell Max-Q)
+
+Re-probe of the GB10 INT8 GEMM verdicts (2026-08-25 cuBLASLt REJECT, the
+precision table) on `sm_120` with CUDA 13.4 (cuBLASLt 130800). No library code
+changed. fox-fast still gives `4facfc896f6f`.
+
+### Where fox-fast denoise goes
+
+`nsys` over the denoise window (2.10 s, kernels 2.09 s, so the GPU is never
+idle). The DiT runs 1894 tokens.
+
+| Kernel | Calls | Time | Share |
+|---|---:|---:|---:|
+| cuBLAS INT8 GEMM (`nvjet_sm120_bii_mma_*`) | 1980 | 1.342 s | **64%** |
+| `h3_sdpa_bf16_mma_d128_kernel` | 494 | 0.471 s | 22% |
+| fused epilogues (SwiGLU+quant, QKV+RoPE, gate+AdaLN+quant, head-major quant) | 2428 | 0.267 s | 13% |
+| everything else | | 0.016 s | 1% |
+
+Median per call: QKV 0.81 ms, attention out 0.28 ms, FC1 1.07 ms, FC2 0.58 ms.
+All four GEMMs already fold their rescale into the next fused kernel, so the
+standalone `h3_int8_apply_scales_bf16_kernel` never runs on the default path.
+The remaining INT8 cost is the cuBLAS kernel itself.
+
+### Benchmark trap: constant operands flatter the GEMM
+
+Before this entry, `h3_gemm_precision` filled every matrix with `0x11`. On
+SM120 that runs INT8 GEMM **1.32×** faster than real activations, and BF16
+1.37× faster. The same slowdown shows in a `cublasGemmEx` replay of the DiT
+sequence (ms, QKV / FC1):
+
+| Operands | QKV | FC1 |
+|---|---:|---:|
+| constant `0x11` / all zero / all 127 | 0.578 / 0.569 / 0.596 | 0.737 / 0.728 / 0.769 |
+| alternating ±5, or a period-16 ramp | 0.591 / 0.588 | 0.758 / 0.754 |
+| period-7 pattern | 0.690 | 0.907 |
+| uniform random ±1 | 0.768 | 1.007 |
+| uniform random ±127 | 0.810 | 1.077 |
+
+The magnitude hardly matters. What slows it is values that don't repeat on a
+power-of-two period. The bench now fills random operands and realistic scales,
+and `--constant` restores the old fill. Random-fill numbers match production.
+Ratios between precisions barely move, so the GB10 rankings were not distorted
+by this, but absolute TFLOP/s from constant fills are too high.
+
+### Precision table on SM120 (random operands, 1894 tokens)
+
+ms per GEMM, `tests/bench_gemm_precision.cu`:
+
+| Shape | bf16 | **int8** | int8+apply | fp8 e4m3 | int8 D=i8 | nvfp4 | mxfp8 | mxfp4 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| qkv `out=21504 k=5376` | 1.488 | **0.746** | 0.905 | 0.796 | 0.728 | 0.453 | 0.891 | no algorithm |
+| attn-out `out=5376 k=7168` | 0.483 | **0.255** | 0.283 | 0.256 | 0.252 | 0.136 | 0.290 | no algorithm |
+| fc1 `out=28672 k=5376` | 1.955 | **0.986** | 1.194 | 1.050 | 0.957 | 0.599 | 1.207 | no algorithm |
+| fc2 `out=5376 k=14336` | 1.117 | **0.523** | 0.566 | 0.505 | 0.494 | 0.288 | 0.593 | no algorithm |
+| **one layer** | 5.043 | **2.510** | 2.948 | 2.607 | 2.431 | 1.476 | 2.981 | |
+| vs int8 | 2.01× | 1.00× | 1.17× | 1.04× | 0.97× | 0.59× | 1.19× | |
+
+GB10 had FP8 at 0.57× and `D=i8` at 0.63× of the INT8 path it paid then
+(with the apply pass). On SM120 both advantages are gone.
+
+### cuBLASLt heuristic table on SM120
+
+`tools/h3_lt_int8_probe.cu` (`make -f Makefile.linux h3_lt_int8_probe`). A and B
+are `i8`. Every accepted variant is checked against a host reference.
+
+| D | Compute | Scaling | Result |
+|---|---|---|---|
+| i32 | 32I | none | ok, 8 algorithms, exact (today) |
+| i8 | 32I | none | ok, but saturates: no output scale, so unusable |
+| f32 / bf16 / f16 | 32I | none | NOT_SUPPORTED |
+| f32 | 32F | none | ok, exact but unscaled, and 18–29% slower than i32 |
+| bf16 | 32F | none | NOT_SUPPORTED |
+| i32 | 32I | alpha device vector (i32 / f32) | NOT_SUPPORTED / INVALID_VALUE |
+| f32 / bf16 | 32F | alpha device vector | NOT_SUPPORTED |
+| bf16 | 32I or 32F | outer vector | NOT_SUPPORTED |
+| f32 / i32 | 32F / 32I | outer vector | INVALID_VALUE |
+| bf16 | 32F / 32I | scalar 32F, VEC128 32F | NOT_SUPPORTED |
+
+The INT8 kernels also refuse odd sizes outright (37×29×256 gets no algorithm
+even for `i32`). This is the same answer as GB10: INT8 matmul writes `i32` or
+`i8` and takes no scales.
+
+Algorithm search, random operands: the heuristic's first pick is the fastest on
+QKV and FC1. On FC2, algorithm 1 is 0.498 ms against 0.522 ms. Integer results
+are exact whichever algorithm runs, but the gain is ~12 ms of fox-fast denoise
+(0.6%), too small for an Lt plan cache.
+
+`cublasGemmEx` against `cublasLtMatmul` (heuristic pick, 64 MiB workspace),
+interleaved in one process over 6 rounds: 2.939–2.964 against 2.947–2.972 ms
+per layer. They are identical.
+
+### Power cap
+
+Sustained INT8 GEMM reaches the board's 300 W software power cap (throttle
+reason `0x4`) within 2–3 s. The SM clock falls from 2272–2355 MHz to about
+1515 MHz, and per-layer GEMM time rises from 2.72 to 2.94–2.96 ms (+9%).
+fox-fast's 2 s denoise mostly finishes before the cap, but the 15 s preset runs
+capped. The board allows up to 325 W. That is a host setting, not a code
+change, and it is untested.
+
+### Verdicts
+
+| Option | Verdict | Why |
+|---|---|---|
+| Fold scales into cuBLASLt (outer vec, alpha vec, float D) | REJECT | unsupported on `sm_120` / CUDA 13.4 |
+| Drop the `i32` accumulator (`D=i8`) | REJECT | 3% of GEMM, and unreachable without an output scale |
+| FP8 e4m3 | REJECT | 4% *slower* than INT8 here, with 11× the MLP error (2026-08-25) |
+| MXFP8 | REJECT | 19% slower than INT8 |
+| NVFP4 | REJECT (quality) | 0.59× GEMM time, about 0.55 s of fox-fast denoise at most, but 7.4× INT8's weight error, past the 13-level frame |
+| cuBLASLt instead of `cublasGemmEx` | REJECT | identical |
+| FC2 second algorithm | not pursued | 0.6% of denoise |
+
+On SM120 the INT8 linear path is the cuBLAS kernel plus 0.27 s of fused
+epilogues, and no precision or API variant beats it at equal quality. Logs and
+the replay harnesses are kept outside the repo, in the state directory.
+
 ## 2026-09-17 — SM120 long-N SDPA probes: no bit-identical win (RTX PRO 6000 Blackwell Max-Q)
 
 The MMA SDPA kernel is 74% of the 15 s wall on SM120. It was probed with

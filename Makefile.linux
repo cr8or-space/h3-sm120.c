@@ -55,6 +55,9 @@ h3_cuda_probe: tools/h3_cuda_probe.o h3_cuda.o
 h3_gemm_precision: tests/bench_gemm_precision.cu
 	$(NVCC) $(NVCCFLAGS) $< -o $@ -lcublas -lcublasLt
 
+h3_lt_int8_probe: tools/h3_lt_int8_probe.cu
+	$(NVCC) $(NVCCFLAGS) $< -o $@ -lcublas -lcublasLt
+
 h3_sdpa_bench: tools/h3_sdpa_bench.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
@@ -231,6 +234,6 @@ clean:
 		h3_cuda_text_smoke h3_cuda_vision_smoke h3_cuda_dit_forward_smoke \
 		h3_cuda_video_vae_smoke h3_cuda_audio_vae_smoke \
 		h3_cuda_video_encoder_smoke h3_cuda_audio_encoder_smoke \
-		h3_cuda_probe h3_gemm_precision h3_sdpa_bench libh3_cuda.a \
+		h3_cuda_probe h3_gemm_precision h3_lt_int8_probe h3_sdpa_bench libh3_cuda.a \
 		tokenizer_test tokenizer_smoke \
 		*.o *.d tests/*.o tests/*.d tools/*.o tools/*.d third_party/*.o third_party/*.d

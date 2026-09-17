@@ -88,7 +88,12 @@ against MLX fixtures in `misc/fixtures/`. Those fixtures are not present, so the
 Linux build does not wire them up.
 
 Microbenches: `make -f Makefile.linux h3_sdpa_bench && ./h3_sdpa_bench <seq> <heads> <head_dim> <iters>`
-(for example `44800 56 128 3`, the 15 s sequence length), and `h3_gemm_precision`.
+(for example `44800 56 128 3`, the 15 s sequence length), `h3_gemm_precision`
+(per-precision GEMM rates at DiT shapes) and `h3_lt_int8_probe` (which cuBLASLt
+INT8 variants this GPU accepts). Benchmark GEMMs on random operands. Constant
+fills run INT8/BF16 GEMM ~1.3× faster than real data on SM120. Sustained load
+also hits the 300 W power cap after 2–3 s (~9% slower), so short bursts
+overstate long runs.
 
 ## Architecture
 
@@ -152,23 +157,18 @@ Key cross-file facts:
 Remaining items from the first SM120 baseline, best first. Measurements go in
 `docs/PERF_BASELINE.md`. When an item is finished, delete it from this list.
 
-1. **INT8 GEMM options on SM120.** INT8 GEMM is ~60% of short-clip denoise.
-   GB10 found that the `i32` accumulator write alone is 19% of INT8 GEMM time,
-   and that cuBLASLt there could not write BF16/F32 or take per-vector scales
-   (2026-08-25 REJECT). Re-probe that heuristic table on `sm_120` with the
-   current CUDA before assuming the same answer.
-2. **Video VAE decode (~22 s on a 15 s clip).** The F32 path lost on GB10's
+1. **Video VAE decode (~22 s on a 15 s clip).** The F32 path lost on GB10's
    memory limits. SM120 has 70+ GiB of VRAM headroom, so re-price the higher
    precision variants and the tile choice there. Bigger tiles showed seams:
    keep that REJECT.
-3. **Anchored session prompts still reload.** With `--first`/`--last` or
+2. **Anchored session prompts still reload.** With `--first`/`--last` or
    references, each new prompt re-runs the vision encoder and VAE encoder
    loads (fox-s2 knobs: 14.8 s per new prompt, against ~3 s for plain T2VA).
-4. **Long-N SDPA needs a new kernel shape, not a retune.** Tile, warp,
+3. **Long-N SDPA needs a new kernel shape, not a retune.** Tile, warp,
    occupancy and barrier probes were all REJECT on 2026-09-17. The open idea
    is fewer K/V staging bytes per FLOP, e.g. several query tiles sharing one
    staged KV tile.
-5. **Memory-pool release threshold.** The 24 GiB value in `h3_gpu_create`
+4. **Memory-pool release threshold.** The 24 GiB value in `h3_gpu_create`
    is still unmeasured on SM120.
 
 ## Generate presets and quality rules
