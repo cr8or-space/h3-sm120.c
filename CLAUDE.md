@@ -147,6 +147,30 @@ Key cross-file facts:
   CUDA's unified *addressing* flag, not shared physical memory: on SM120 the
   96 GB is separate from host RAM.
 
+## Open SM120 work
+
+Remaining items from the first SM120 baseline, best first. Measurements go in
+`docs/PERF_BASELINE.md`. When an item is finished, delete it from this list.
+
+1. **INT8 GEMM options on SM120.** INT8 GEMM is ~60% of short-clip denoise.
+   GB10 found that the `i32` accumulator write alone is 19% of INT8 GEMM time,
+   and that cuBLASLt there could not write BF16/F32 or take per-vector scales
+   (2026-08-25 REJECT). Re-probe that heuristic table on `sm_120` with the
+   current CUDA before assuming the same answer.
+2. **Video VAE decode (~22 s on a 15 s clip).** The F32 path lost on GB10's
+   memory limits. SM120 has 70+ GiB of VRAM headroom, so re-price the higher
+   precision variants and the tile choice there. Bigger tiles showed seams:
+   keep that REJECT.
+3. **Anchored session prompts still reload.** With `--first`/`--last` or
+   references, each new prompt re-runs the vision encoder and VAE encoder
+   loads (fox-s2 knobs: 14.8 s per new prompt, against ~3 s for plain T2VA).
+4. **Long-N SDPA needs a new kernel shape, not a retune.** Tile, warp,
+   occupancy and barrier probes were all REJECT on 2026-09-17. The open idea
+   is fewer K/V staging bytes per FLOP, e.g. several query tiles sharing one
+   staged KV tile.
+5. **Memory-pool release threshold.** The 24 GiB value in `h3_gpu_create`
+   is still unmeasured on SM120.
+
 ## Generate presets and quality rules
 
 The `--profile` flag prints per-phase wall time (text encoder, DiT denoise
