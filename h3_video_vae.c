@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -650,29 +651,19 @@ static int run_resident_tile(vae_context *vae, char *error,
     return 1;
 }
 
-static int unpack_frame_range(vae_context *vae, int first_frame,
-                              int frame_count, h3_video_frames *output,
-                              char *error, size_t error_size) {
-    if (first_frame < 0 || frame_count < 1 ||
-        first_frame > vae->output_frames - frame_count) {
-        fail(error, error_size, "invalid video VAE output frame range");
-        return 0;
-    }
-    size_t projected_count = (size_t)vae->sequence * OUTPUT_PATCH;
-    float *rows = malloc(projected_count * sizeof(*rows));
+/* Host-only half of an unpack, so it can run off the GPU's thread: turns the
+ * projected patches of one tile into clamped RGB. */
+static int unpack_rows(const vae_context *vae, const float *rows,
+                       int first_frame, int frame_count,
+                       h3_video_frames *output, char *error,
+                       size_t error_size) {
     int pixel_h = vae->latent_h * 16;
     int pixel_w = vae->latent_w * 16;
     size_t rgb_count = (size_t)frame_count * (size_t)pixel_h *
                        (size_t)pixel_w * 3;
     float *rgb = malloc(rgb_count * sizeof(*rgb));
-    if (!rows || !rgb) {
-        free(rows); free(rgb);
+    if (!rgb) {
         fail(error, error_size, "out of memory unpacking video VAE frames");
-        return 0;
-    }
-    if (!h3_gpu_tensor_read_f32(vae->projected, rows, projected_count)) {
-        free(rows); free(rgb);
-        fail(error, error_size, "cannot read video VAE output patches");
         return 0;
     }
     static const float mean[] = {0.485f, 0.456f, 0.406f};
@@ -708,12 +699,43 @@ static int unpack_frame_range(vae_context *vae, int first_frame,
             }
         }
     }
-    free(rows);
     output->frames = frame_count;
     output->height = pixel_h;
     output->width = pixel_w;
     output->rgb = rgb;
-    return h3_gpu_get_stats(vae->gpu, &output->gpu_stats);
+    return 1;
+}
+
+static float *read_projected(vae_context *vae, char *error,
+                             size_t error_size) {
+    size_t projected_count = (size_t)vae->sequence * OUTPUT_PATCH;
+    float *rows = malloc(projected_count * sizeof(*rows));
+    if (!rows) {
+        fail(error, error_size, "out of memory unpacking video VAE frames");
+        return NULL;
+    }
+    if (!h3_gpu_tensor_read_f32(vae->projected, rows, projected_count)) {
+        free(rows);
+        fail(error, error_size, "cannot read video VAE output patches");
+        return NULL;
+    }
+    return rows;
+}
+
+static int unpack_frame_range(vae_context *vae, int first_frame,
+                              int frame_count, h3_video_frames *output,
+                              char *error, size_t error_size) {
+    if (first_frame < 0 || frame_count < 1 ||
+        first_frame > vae->output_frames - frame_count) {
+        fail(error, error_size, "invalid video VAE output frame range");
+        return 0;
+    }
+    float *rows = read_projected(vae, error, error_size);
+    if (!rows) return 0;
+    int ok = unpack_rows(vae, rows, first_frame, frame_count, output, error,
+                         error_size);
+    free(rows);
+    return ok && h3_gpu_get_stats(vae->gpu, &output->gpu_stats);
 }
 
 static int unpack_frames(vae_context *vae, h3_video_frames *output,
@@ -1052,6 +1074,116 @@ int h3_video_vae_decoder_preview(h3_video_vae_decoder *decoder,
     return ok;
 }
 
+/* Host half of a full decode. On SM120 the GPU finishes a tile while the host
+ * is still unpacking, stitching and blending the previous one (~3 s of a 15 s
+ * clip's 21 s decode, all of it GPU idle), so the GPU's thread only reads each
+ * tile's patches back and queues them. This thread unpacks, stitches and blends
+ * in submission order while the next tile runs: the same arithmetic in the same
+ * order, so the frames are bit-identical. H3_VAE_SERIAL_HOST=1 runs it inline
+ * on the GPU's thread instead. */
+enum { FINISHER_QUEUE = 8 };
+
+typedef struct {
+    h3_video_vae_decoder *decoder;
+    pthread_mutex_t lock;
+    pthread_cond_t work;
+    pthread_cond_t space;
+    float *queue[FINISHER_QUEUE];
+    int head;
+    int count;
+    int closed;
+    int failed;
+    char error[512];
+    int tiles_per_chunk;
+    int completed;
+    float **tiles;
+    size_t frame_elements;
+    float *final_rgb;
+    float *temporal_overlap;
+} vae_finisher;
+
+/* Consumes one tile's projected patches; when it completes a chunk, stitches
+ * the chunk and blends it into the output. */
+static int finisher_consume(vae_finisher *finisher, const float *rows) {
+    h3_video_vae_decoder *decoder = finisher->decoder;
+    int tile = finisher->completed % finisher->tiles_per_chunk;
+    int chunk = finisher->completed / finisher->tiles_per_chunk;
+    h3_video_frames unpacked;
+    memset(&unpacked, 0, sizeof(unpacked));
+    if (!unpack_rows(&decoder->vae, rows, 0, FIRST_CHUNK_FRAMES, &unpacked,
+                     finisher->error, sizeof(finisher->error)))
+        return 0;
+    finisher->tiles[tile] = unpacked.rgb;
+    finisher->completed++;
+    if (tile + 1 < finisher->tiles_per_chunk) return 1;
+
+    h3_video_frames decoded;
+    memset(&decoded, 0, sizeof(decoded));
+    int ok = stitch_tiles(finisher->tiles, &decoder->y_axis, &decoder->x_axis,
+                          FIRST_CHUNK_FRAMES, &decoded, finisher->error,
+                          sizeof(finisher->error));
+    for (int index = 0; index < finisher->tiles_per_chunk; index++) {
+        free(finisher->tiles[index]);
+        finisher->tiles[index] = NULL;
+    }
+    if (!ok) return 0;
+    size_t frame_elements = finisher->frame_elements;
+    if (chunk) for (int frame = 0; frame < 5; frame++) {
+        float alpha = (float)frame / 5.0f;
+        size_t base = (size_t)frame * frame_elements;
+        for (size_t index = 0; index < frame_elements; index++)
+            decoded.rgb[base + index] =
+                finisher->temporal_overlap[base + index] * (1.0f - alpha) +
+                decoded.rgb[base + index] * alpha;
+    }
+    memcpy(finisher->final_rgb + (size_t)chunk * 17 * frame_elements,
+           decoded.rgb, 17 * frame_elements * sizeof(*finisher->final_rgb));
+    memcpy(finisher->temporal_overlap, decoded.rgb + 17 * frame_elements,
+           5 * frame_elements * sizeof(*finisher->temporal_overlap));
+    h3_video_frames_free(&decoded);
+    return 1;
+}
+
+static void *finisher_main(void *opaque) {
+    vae_finisher *finisher = opaque;
+    pthread_mutex_lock(&finisher->lock);
+    for (;;) {
+        while (!finisher->count && !finisher->closed)
+            pthread_cond_wait(&finisher->work, &finisher->lock);
+        if (!finisher->count) break;
+        float *rows = finisher->queue[finisher->head];
+        finisher->head = (finisher->head + 1) % FINISHER_QUEUE;
+        finisher->count--;
+        int failed = finisher->failed;
+        pthread_mutex_unlock(&finisher->lock);
+        int ok = failed || finisher_consume(finisher, rows);
+        free(rows);
+        pthread_mutex_lock(&finisher->lock);
+        if (!ok) finisher->failed = 1;
+        pthread_cond_signal(&finisher->space);
+    }
+    pthread_mutex_unlock(&finisher->lock);
+    return NULL;
+}
+
+/* Hands a tile to the finisher, waiting for queue space. Takes ownership of
+ * rows. Returns 0 once the finisher has failed. */
+static int finisher_submit(vae_finisher *finisher, float *rows) {
+    pthread_mutex_lock(&finisher->lock);
+    while (finisher->count == FINISHER_QUEUE && !finisher->failed)
+        pthread_cond_wait(&finisher->space, &finisher->lock);
+    int ok = !finisher->failed;
+    if (ok) {
+        finisher->queue[(finisher->head + finisher->count) % FINISHER_QUEUE] =
+            rows;
+        finisher->count++;
+        pthread_cond_signal(&finisher->work);
+    }
+    pthread_mutex_unlock(&finisher->lock);
+    if (!ok) free(rows);
+    return ok;
+}
+
 int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
                         const float *normalized_latent, int latent_time,
                         h3_video_frames *output,
@@ -1067,49 +1199,107 @@ int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
     int output_frames = chunks * 17 + 5;
     int pixel_h = decoder->latent_h * SPATIAL_RATIO;
     int pixel_w = decoder->latent_w * SPATIAL_RATIO;
-    size_t frame_elements = (size_t)pixel_h * (size_t)pixel_w * 3;
-    size_t output_elements = (size_t)output_frames * frame_elements;
-    float *final_rgb = malloc(output_elements * sizeof(*final_rgb));
-    float *temporal_overlap = malloc(5 * frame_elements *
-                                     sizeof(*temporal_overlap));
-    if (!final_rgb || !temporal_overlap) {
-        free(final_rgb);
-        free(temporal_overlap);
+    vae_finisher finisher;
+    memset(&finisher, 0, sizeof(finisher));
+    finisher.decoder = decoder;
+    finisher.tiles_per_chunk = decoder->y_axis.count * decoder->x_axis.count;
+    finisher.frame_elements = (size_t)pixel_h * (size_t)pixel_w * 3;
+    finisher.final_rgb = malloc((size_t)output_frames *
+                                finisher.frame_elements *
+                                sizeof(*finisher.final_rgb));
+    finisher.temporal_overlap = malloc(5 * finisher.frame_elements *
+                                       sizeof(*finisher.temporal_overlap));
+    finisher.tiles = calloc((size_t)finisher.tiles_per_chunk,
+                            sizeof(*finisher.tiles));
+    if (!finisher.final_rgb || !finisher.temporal_overlap ||
+        !finisher.tiles) {
+        free(finisher.final_rgb);
+        free(finisher.temporal_overlap);
+        free(finisher.tiles);
         fail(error, error_size, "out of memory retaining decoded video frames");
         return 0;
     }
-    int ok = 1;
-    for (int chunk = 0; chunk < chunks && ok; chunk++) {
-        h3_video_frames decoded;
-        memset(&decoded, 0, sizeof(decoded));
-        ok = decoder_decode_chunk(decoder, normalized_latent, latent_time,
-                                  chunk, -1, &decoded, error, error_size);
-        if (!ok) break;
-        if (chunk) for (int frame = 0; frame < 5; frame++) {
-            float alpha = (float)frame / 5.0f;
-            size_t base = (size_t)frame * frame_elements;
-            for (size_t index = 0; index < frame_elements; index++)
-                decoded.rgb[base + index] = temporal_overlap[base + index] *
-                    (1.0f - alpha) + decoded.rgb[base + index] * alpha;
+    int threaded = !env_on("H3_VAE_SERIAL_HOST");
+    pthread_t thread;
+    if (threaded) {
+        pthread_mutex_init(&finisher.lock, NULL);
+        pthread_cond_init(&finisher.work, NULL);
+        pthread_cond_init(&finisher.space, NULL);
+        if (pthread_create(&thread, NULL, finisher_main, &finisher) != 0) {
+            pthread_cond_destroy(&finisher.space);
+            pthread_cond_destroy(&finisher.work);
+            pthread_mutex_destroy(&finisher.lock);
+            threaded = 0;
         }
-        memcpy(final_rgb + (size_t)chunk * 17 * frame_elements,
-               decoded.rgb, 17 * frame_elements * sizeof(*final_rgb));
-        memcpy(temporal_overlap, decoded.rgb + 17 * frame_elements,
-               5 * frame_elements * sizeof(*temporal_overlap));
-        h3_video_frames_free(&decoded);
     }
+
+    vae_context *vae = &decoder->vae;
+    int ok = 1;
+    for (int chunk = 0; chunk < chunks && ok; chunk++)
+        for (int tile_y = 0; tile_y < decoder->y_axis.count && ok; tile_y++)
+            for (int tile_x = 0; tile_x < decoder->x_axis.count && ok;
+                 tile_x++) {
+                float *input = extract_latent_tile(
+                    normalized_latent, latent_time, decoder->latent_h,
+                    decoder->latent_w, chunk * 5,
+                    decoder->y_axis.starts[tile_y] / SPATIAL_RATIO,
+                    decoder->x_axis.starts[tile_x] / SPATIAL_RATIO,
+                    CHUNK_LATENT_TIME, vae->latent_h, vae->latent_w, error,
+                    error_size);
+                if (!input) {
+                    ok = 0;
+                    break;
+                }
+                free_tensor(&vae->latent);
+                ok = prepare_input(vae, input, decoder->latent_mean,
+                                   decoder->latent_std, error, error_size) &&
+                     run_resident_tile(vae, error, error_size);
+                free(input);
+                float *rows = ok ? read_projected(vae, error, error_size)
+                                 : NULL;
+                if (!rows) {
+                    ok = 0;
+                    break;
+                }
+                if (threaded) {
+                    ok = finisher_submit(&finisher, rows);
+                } else {
+                    ok = finisher_consume(&finisher, rows);
+                    free(rows);
+                    if (!ok) fail(error, error_size, "%s", finisher.error);
+                }
+            }
+    if (threaded) {
+        pthread_mutex_lock(&finisher.lock);
+        finisher.closed = 1;
+        pthread_cond_signal(&finisher.work);
+        pthread_mutex_unlock(&finisher.lock);
+        pthread_join(thread, NULL);
+        if (finisher.failed) {
+            if (ok) fail(error, error_size, "%s", finisher.error);
+            ok = 0;
+        }
+        pthread_cond_destroy(&finisher.space);
+        pthread_cond_destroy(&finisher.work);
+        pthread_mutex_destroy(&finisher.lock);
+    }
+    for (int index = 0; index < finisher.tiles_per_chunk; index++)
+        free(finisher.tiles[index]);
+    free(finisher.tiles);
     if (ok) {
-        memcpy(final_rgb + (size_t)chunks * 17 * frame_elements,
-               temporal_overlap, 5 * frame_elements * sizeof(*final_rgb));
+        memcpy(finisher.final_rgb +
+                   (size_t)chunks * 17 * finisher.frame_elements,
+               finisher.temporal_overlap,
+               5 * finisher.frame_elements * sizeof(*finisher.final_rgb));
         output->frames = output_frames;
         output->height = pixel_h;
         output->width = pixel_w;
-        output->rgb = final_rgb;
-        final_rgb = NULL;
-        ok = h3_gpu_get_stats(decoder->vae.gpu, &output->gpu_stats);
+        output->rgb = finisher.final_rgb;
+        finisher.final_rgb = NULL;
+        ok = h3_gpu_get_stats(vae->gpu, &output->gpu_stats);
     }
-    free(final_rgb);
-    free(temporal_overlap);
+    free(finisher.final_rgb);
+    free(finisher.temporal_overlap);
     if (!ok) h3_video_frames_free(output);
     return ok;
 }
@@ -1122,138 +1312,24 @@ void h3_video_vae_decoder_free(h3_video_vae_decoder *decoder) {
     free(decoder);
 }
 
+/* A multi-chunk or multi-tile decode is the resident decoder, loaded for one
+ * call. */
 static int decode_chunked(const char *weight_directory,
                           const char *shader_source_path,
                           const float *normalized_latent, int latent_time,
                           int latent_height, int latent_width,
-                          const float *latent_mean, const float *latent_std,
-                          int tile_pixels,
-                          h3_video_vae_progress progress, void *progress_opaque,
-                          h3_video_frames *output, char *error,
-                          size_t error_size) {
-    tile_axis y_axis, x_axis;
-    memset(&y_axis, 0, sizeof(y_axis));
-    memset(&x_axis, 0, sizeof(x_axis));
-    int ok = tile_axis_build(latent_height * SPATIAL_RATIO, tile_pixels,
-                             &y_axis,
-                             error, error_size) &&
-             tile_axis_build(latent_width * SPATIAL_RATIO, tile_pixels,
-                             &x_axis,
-                             error, error_size);
-    if (!ok) {
-        tile_axis_free(&y_axis); tile_axis_free(&x_axis);
-        return 0;
-    }
-    if (getenv("H3_PROFILE"))
-        fprintf(stderr, "h3: video VAE tiles %dx%d at %d pixels\n",
-                x_axis.count, y_axis.count, tile_pixels);
-    vae_context vae;
-    memset(&vae, 0, sizeof(vae));
-    vae.latent_h = y_axis.length / SPATIAL_RATIO;
-    vae.latent_w = x_axis.length / SPATIAL_RATIO;
-    vae.latent_t = CHUNK_LATENT_TIME;
-    vae.output_frames = FIRST_CHUNK_FRAMES;
-    vae.patches = (uint32_t)(CHUNK_LATENT_TIME * vae.latent_h * vae.latent_w);
-    vae.sequence = vae.patches + SUFFIX;
-    vae.int8_vae = env_on("H3_INT8_VAE");
-    vae.weights = h3_weight_store_open(weight_directory, error, error_size);
-    if (vae.weights)
-        vae.gpu = h3_gpu_create(shader_source_path, error, error_size);
-    if (vae.gpu) {
-        h3_gpu_profile_set_label(vae.gpu, "video VAE decoder");
-        if (vae.int8_vae)
-            fprintf(stderr, "h3: video VAE INT8 weights enabled\n");
-    }
-    ok = vae.weights && vae.gpu &&
-         load_resident_weights(&vae, progress, progress_opaque,
-                               error, error_size) &&
-         prepare_rope(&vae, error, error_size) &&
-         allocate_activations(&vae, error, error_size);
-    int tile_count = y_axis.count * x_axis.count;
-    int chunks = (latent_time - 2) / 5;
-    int output_frames = chunks * 17 + 5;
-    int pixel_h = latent_height * SPATIAL_RATIO;
-    int pixel_w = latent_width * SPATIAL_RATIO;
-    size_t frame_elements = (size_t)pixel_h * (size_t)pixel_w * 3;
-    size_t output_elements = (size_t)output_frames * frame_elements;
-    float *final_rgb = ok ? malloc(output_elements * sizeof(*final_rgb)) : NULL;
-    float *temporal_overlap = ok ? malloc(5 * frame_elements *
-                                          sizeof(*temporal_overlap)) : NULL;
-    if (ok && (!final_rgb || !temporal_overlap)) {
-        fail(error, error_size, "out of memory retaining decoded video frames");
-        ok = 0;
-    }
-    for (int chunk = 0; chunk < chunks && ok; chunk++) {
-        float **tiles = calloc((size_t)tile_count, sizeof(*tiles));
-        if (!tiles) {
-            fail(error, error_size, "out of memory retaining video VAE tiles");
-            ok = 0;
-            break;
-        }
-        for (int tile_y = 0; tile_y < y_axis.count && ok; tile_y++)
-            for (int tile_x = 0; tile_x < x_axis.count && ok; tile_x++) {
-                float *input = extract_latent_tile(normalized_latent,
-                    latent_time, latent_height, latent_width, chunk * 5,
-                    y_axis.starts[tile_y] / SPATIAL_RATIO,
-                    x_axis.starts[tile_x] / SPATIAL_RATIO,
-                    CHUNK_LATENT_TIME, vae.latent_h, vae.latent_w,
-                    error, error_size);
-                if (!input) {
-                    ok = 0;
-                    break;
-                }
-                free_tensor(&vae.latent);
-                ok = prepare_input(&vae, input, latent_mean, latent_std,
-                                   error, error_size) &&
-                     run_resident_tile(&vae, error, error_size);
-                free(input);
-                if (!ok) break;
-                h3_video_frames tile;
-                memset(&tile, 0, sizeof(tile));
-                ok = unpack_frames(&vae, &tile, error, error_size);
-                if (ok) {
-                    int index = tile_y * x_axis.count + tile_x;
-                    tiles[index] = tile.rgb;
-                }
-            }
-        h3_video_frames decoded;
-        memset(&decoded, 0, sizeof(decoded));
-        if (ok) ok = stitch_tiles(tiles, &y_axis, &x_axis,
-                                  FIRST_CHUNK_FRAMES, &decoded,
-                                  error, error_size);
-        for (int index = 0; index < tile_count; index++) free(tiles[index]);
-        free(tiles);
-        if (!ok) {
-            h3_video_frames_free(&decoded);
-            break;
-        }
-        if (chunk) for (int frame = 0; frame < 5; frame++) {
-            float alpha = (float)frame / 5.0f;
-            size_t base = (size_t)frame * frame_elements;
-            for (size_t index = 0; index < frame_elements; index++)
-                decoded.rgb[base + index] = temporal_overlap[base + index] *
-                    (1.0f - alpha) + decoded.rgb[base + index] * alpha;
-        }
-        memcpy(final_rgb + (size_t)chunk * 17 * frame_elements,
-               decoded.rgb, 17 * frame_elements * sizeof(*final_rgb));
-        memcpy(temporal_overlap, decoded.rgb + 17 * frame_elements,
-               5 * frame_elements * sizeof(*temporal_overlap));
-        h3_video_frames_free(&decoded);
-    }
-    if (ok) {
-        memcpy(final_rgb + (size_t)chunks * 17 * frame_elements,
-               temporal_overlap, 5 * frame_elements * sizeof(*final_rgb));
-        output->frames = output_frames;
-        output->height = pixel_h;
-        output->width = pixel_w;
-        output->rgb = final_rgb;
-        final_rgb = NULL;
-        ok = h3_gpu_get_stats(vae.gpu, &output->gpu_stats);
-    }
-    free(final_rgb);
-    free(temporal_overlap);
-    cleanup(&vae);
-    tile_axis_free(&y_axis); tile_axis_free(&x_axis);
+                          h3_video_vae_progress progress,
+                          void *progress_opaque, h3_video_frames *output,
+                          char *error, size_t error_size) {
+    h3_video_vae_decoder *decoder = h3_video_vae_decoder_load(
+        weight_directory, shader_source_path, latent_height, latent_width,
+        progress, progress_opaque, error, error_size);
+    if (!decoder) return 0;
+    h3_gpu_profile_set_label(decoder->vae.gpu, "video VAE decoder");
+    int ok = h3_video_vae_decoder_decode(decoder, normalized_latent,
+                                         latent_time, output, error,
+                                         error_size);
+    h3_video_vae_decoder_free(decoder);
     return ok;
 }
 
@@ -1310,9 +1386,8 @@ int h3_video_vae_decode(const char *weight_directory,
         latent_width > tile_pixels / SPATIAL_RATIO) {
         int ok = decode_chunked(weight_directory, shader_source_path,
                                 normalized_latent, latent_time, latent_height,
-                                latent_width, latent_mean, latent_std,
-                                tile_pixels, progress,
-                                progress_opaque, output, error, error_size);
+                                latent_width, progress, progress_opaque,
+                                output, error, error_size);
         if (!ok) h3_video_frames_free(output);
         return ok;
     }

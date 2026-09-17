@@ -1849,6 +1849,24 @@ static h3_result *h3_generate_once(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
+    /* H3_DUMP_VIDEO_LATENT=<file> saves the finished latent so the decode can
+     * be benchmarked alone (tools/h3_vae_bench.c) instead of re-running the
+     * denoise for every VAE experiment. */
+    const char *latent_dump = getenv("H3_DUMP_VIDEO_LATENT");
+    if (latent_dump && *latent_dump) {
+        FILE *file = fopen(latent_dump, "wb");
+        int32_t header[4] = {temporal.video_t, latent_h, latent_w,
+                             (int32_t)(video_count /
+                                       ((size_t)temporal.video_t *
+                                        (size_t)latent_h * (size_t)latent_w))};
+        int written = file && fwrite("H3VLAT1", 8, 1, file) == 1 &&
+                      fwrite(header, sizeof(header), 1, file) == 1 &&
+                      fwrite(video, sizeof(*video), video_count, file) ==
+                          video_count;
+        if (file) written = fclose(file) == 0 && written;
+        fprintf(stderr, "h3: %s video latent to %s\n",
+                written ? "dumped" : "FAILED to dump", latent_dump);
+    }
     int video_ok = preview_decoder ?
         h3_video_vae_decoder_decode(
             preview_decoder, video, temporal.video_t, &frames,

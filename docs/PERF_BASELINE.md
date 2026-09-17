@@ -7,6 +7,84 @@ numbers are in the snapshots below. The 2026-08-17 tables after them are the
 SM120 (RTX PRO 6000 Blackwell Max-Q) sections are labelled as such. Every
 other section in this file is GB10.
 
+## 2026-09-17 — SM120 video VAE decode: host work off the GPU's thread (RTX PRO 6000 Blackwell Max-Q)
+
+Tooling added for this work:
+- `H3_DUMP_VIDEO_LATENT=<file>` saves a generation's finished latent.
+- `tools/h3_vae_bench.c` (`make -f Makefile.linux h3_vae_bench`) decodes that
+  latent with a resident decoder. It prints the wall time and a hash of the
+  8-bit frames, and with `--ref` a PSNR against a saved decode.
+
+A VAE experiment on the 15 s latent (24×107×30×54, 21 chunks × 8 tiles at
+272 px) now costs about 20 s instead of a 5-minute generation.
+
+### Where the 15 s decode went
+
+`nsys`, one decode, 21.46 s. The GPU is busy for 18.64 s (87%), so unlike
+GB10 this decode is GPU-bound.
+
+| Kernel | Time |
+|---|---:|
+| TF32 GEMM (`nvjet_sm120_sss_tf32_*`) | 12.43 s |
+| `h3_sdpa_f32_mma_d64_kernel` | 4.57 s |
+| SwiGLU, QKV+RoPE, norms, residuals | 1.27 s |
+
+Host timers on the decode loop:
+
+| Host step | Time | Share |
+|---|---:|---:|
+| GPU wait | 17.6 s | |
+| readback + unpack | 1.81 s | |
+| stitch | 0.88 s | |
+| temporal blend | 0.42 s | |
+| latent upload | 0.01 s | |
+
+All ~3.1 s of host work ran on the GPU's thread, so the GPU sat idle through it.
+
+### KEEP: unpack, stitch and blend on a finisher thread
+
+The GPU's thread now only reads each tile's patches back and queues them
+(queue depth 8). A finisher thread unpacks, stitches and blends in submission
+order while the next tile runs. The arithmetic and its order are unchanged. The
+single-shot multi-tile path now loads the resident decoder for one call instead
+of carrying its own copy of the loop. `H3_VAE_SERIAL_HOST=1` is the oracle.
+
+15 s latent, `h3_vae_bench`, two rounds, interleaved:
+
+| Arm | Decode | rgb hash |
+|---|---:|---|
+| serial (`H3_VAE_SERIAL_HOST=1`) | 20.85 / 20.89, 21.25 / 21.10 s | `0565e3cd6ea0b5e4` |
+| **finisher thread** | **18.29 / 18.52, 19.14 / 19.11 s** | `0565e3cd6ea0b5e4` |
+
+End to end:
+- 15 s single-shot: video VAE phase 22.04 → **20.01 s**, e2e 285 s, md5
+  `567a0386480f` (unchanged).
+- fox-fast `4facfc896f6f` and fox-s2 `146495086e36` are unchanged. fox-fast's VAE
+  phase stays at 1.47 s: it is one chunk, and weight load dominates.
+- `make test` passes with no skips.
+
+### Re-priced variants (15 s latent, before the finisher thread)
+
+| Variant | Decode | PSNR vs TF32 | Peak | Verdict |
+|---|---:|---:|---:|---|
+| TF32, 272 px tiles (default) | 20.7–21.0 s | — | 9.41 GiB | |
+| exact FP32 (`H3_DISABLE_F32_TF32=1`) | 52.5 s | 71.5 dB | 9.41 GiB | REJECT: 2.5× slower for invisible change |
+| `H3_VAE_TILE_PIXELS=256` (5×3) | 35.4 s | 45.8 dB | 9.36 GiB | REJECT |
+| `=320` (4×2) | 30.8 s | 39.9 dB | 9.55 GiB | REJECT |
+| `=400` (3×2) | 43.5 s | 31.5 dB | 9.85 GiB | REJECT |
+| `=480` (2×1) | 25.4 s | 27.3 dB | 10.21 GiB | REJECT |
+| `=512` (2×1) | 27.4 s | 26.6 dB | 10.29 GiB | REJECT |
+| `H3_INT8_VAE=1` | 13.9 s | 50.8 dB | 2.68 GiB | opt-in (see below) |
+
+The VRAM headroom does not help, because larger tiles lose to attention's N²
+cost well before memory binds. The tile scorer's 272 px choice stays.
+
+`H3_INT8_VAE=1` with the finisher thread: 11.56 s on the 15 s latent (SSIM
+0.9958, PSNR 50.8 dB against TF32). On fox-fast: VAE phase 1.47 → 1.23 s, PSNR
+44.4 dB and SSIM 0.987 against `4facfc896f6f`. That clears the 24 dB / 0.85
+default gate by a wide margin. It stays opt-in for now, because the project
+rules list it as opt-in.
+
 ## 2026-09-17 — SM120 INT8 GEMM options: nothing to take (RTX PRO 6000 Blackwell Max-Q)
 
 Re-probe of the GB10 INT8 GEMM verdicts (2026-08-25 cuBLASLt REJECT, the

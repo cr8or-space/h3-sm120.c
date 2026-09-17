@@ -90,7 +90,10 @@ Linux build does not wire them up.
 Microbenches: `make -f Makefile.linux h3_sdpa_bench && ./h3_sdpa_bench <seq> <heads> <head_dim> <iters>`
 (for example `44800 56 128 3`, the 15 s sequence length), `h3_gemm_precision`
 (per-precision GEMM rates at DiT shapes) and `h3_lt_int8_probe` (which cuBLASLt
-INT8 variants this GPU accepts). Benchmark GEMMs on random operands. Constant
+INT8 variants this GPU accepts). For the video VAE, dump a real latent with
+`H3_DUMP_VIDEO_LATENT=<file> ./h3 ...`, then time the decode alone with
+`h3_vae_bench <file> [iterations] [--save|--ref rgb.u8]`. It prints an rgb hash
+and PSNR. Benchmark GEMMs on random operands. Constant
 fills run INT8/BF16 GEMM ~1.3× faster than real data on SM120. Sustained load
 also hits the 300 W power cap after 2–3 s (~9% slower), so short bursts
 overstate long runs.
@@ -157,10 +160,12 @@ Key cross-file facts:
 Remaining items from the first SM120 baseline, best first. Measurements go in
 `docs/PERF_BASELINE.md`. When an item is finished, delete it from this list.
 
-1. **Video VAE decode (~22 s on a 15 s clip).** The F32 path lost on GB10's
-   memory limits. SM120 has 70+ GiB of VRAM headroom, so re-price the higher
-   precision variants and the tile choice there. Bigger tiles showed seams:
-   keep that REJECT.
+1. **Video VAE decode (20 s on a 15 s clip).** It is GPU-bound on SM120:
+   12.4 s TF32 GEMM and 4.6 s F32 MMA attention. Host work already runs on a
+   finisher thread. Exact FP32, every tile size and the VRAM headroom were
+   re-priced on 2026-09-17 and all lost. `H3_INT8_VAE=1` is 11.6 s at
+   50.8 dB and is waiting on a decision to make it the default. Open: the
+   attention's warp count (8, chosen on GB10).
 2. **Anchored session prompts still reload.** With `--first`/`--last` or
    references, each new prompt re-runs the vision encoder and VAE encoder
    loads (fox-s2 knobs: 14.8 s per new prompt, against ~3 s for plain T2VA).
